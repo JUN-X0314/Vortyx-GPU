@@ -18,27 +18,39 @@ vortyx::device::DeviceInfo CpuBackend::device_info() const {
     return unknown;
 }
 
-VectorAddResult CpuBackend::execute(const VectorAddTask& task) {
-    VectorAddResult result;
+ComputeResult CpuBackend::execute(const vortyx::resource::IBufferImpl& a,
+                                  const vortyx::resource::IBufferImpl& b,
+                                  vortyx::resource::IBufferImpl& c) {
+    // The buffers must belong to THIS backend. Anything else would mean a
+    // routing bug; reject it instead of reading foreign memory.
+    const vortyx::resource::CpuBuffer* cpu_a =
+        dynamic_cast<const vortyx::resource::CpuBuffer*>(&a);
+    const vortyx::resource::CpuBuffer* cpu_b =
+        dynamic_cast<const vortyx::resource::CpuBuffer*>(&b);
+    vortyx::resource::CpuBuffer* cpu_c = dynamic_cast<vortyx::resource::CpuBuffer*>(&c);
+    if (cpu_a == nullptr || cpu_b == nullptr || cpu_c == nullptr) {
+        return ComputeResult{Status::BackendError,
+                             "buffer does not belong to the cpu backend"};
+    }
 
-    const Status validation = validate_vector_add(task);
+    // Shared task rules: int32 elements, equal non-zero counts, Read inputs,
+    // Write output. Enforced here so direct backend users cannot bypass it.
+    std::string error;
+    const Status validation = validate_vector_add_buffers(a.desc(), b.desc(), c.desc(), error);
     if (validation != Status::Ok) {
-        result.status = validation;
-        result.error = "invalid vector addition task (a.size=" +
-                       std::to_string(task.a.size()) + ", b.size=" +
-                       std::to_string(task.b.size()) + "); arrays must be non-empty and equal size";
-        return result;
+        return ComputeResult{validation, error};
     }
 
-    const std::size_t count = task.a.size();
-    result.data.resize(count);
+    // The actual computation on plain host memory.
+    const std::int32_t* pa = static_cast<const std::int32_t*>(cpu_a->data());
+    const std::int32_t* pb = static_cast<const std::int32_t*>(cpu_b->data());
+    std::int32_t* pc = static_cast<std::int32_t*>(cpu_c->data());
+    const std::size_t count = a.desc().element_count;
     for (std::size_t i = 0; i < count; ++i) {
-        result.data[i] = task.a[i] + task.b[i];
+        pc[i] = pa[i] + pb[i];
     }
 
-    result.status = Status::Ok;
-    result.error.clear();
-    return result;
+    return ComputeResult{Status::Ok, {}};
 }
 
 }  // namespace vortyx::compute

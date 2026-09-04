@@ -22,3 +22,18 @@ add_test(NAME ComputeCpuTest COMMAND test_compute_cpu)
 add_executable(test_compute_gpu test_compute_gpu.cpp)
 target_link_libraries(test_compute_gpu PRIVATE vortyx_core)
 add_test(NAME ComputeGpuTest COMMAND test_compute_gpu)
+
+# Phase 4: Compute Resource & Memory Management.
+# - Resource tests cover the full Buffer lifecycle (create/write/read/release),
+#   error policies, move semantics, stats accounting and shutdown safety on
+#   the CPU (host memory) path; they must pass everywhere.
+# - GPU resource tests allocate REAL Vulkan buffers when a device exists;
+#   on systems without one they exit with an explicit SKIP note (never a
+#   fake success).
+add_executable(test_resource test_resource.cpp)
+target_link_libraries(test_resource PRIVATE vortyx_core)
+add_test(NAME ResourceTest COMMAND test_resource)
+
+add_executable(test_resource_gpu test_resource_gpu.cpp)
+target_link_libraries(test_resource_gpu PRIVATE vortyx_core)
+add_test(NAME ResourceGpuTest COMMAND test_resource_gpu)

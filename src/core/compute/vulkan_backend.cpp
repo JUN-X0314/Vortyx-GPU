@@ -1,12 +1,21 @@
-// Vulkan compute backend implementation (Phase 3).
+// Vulkan compute backend implementation (Phase 4).
 //
 // Real Vulkan compute path implemented here:
 //   instance -> physical device enumeration/selection -> logical device +
 //   compute queue -> command pool -> descriptor layout -> compute pipeline
-//   (embedded SPIR-V) -> per-execution storage buffers -> dispatch -> readback.
+//   (embedded SPIR-V) -> buffer provider (Phase 4) -> dispatch on
+//   Resource-Manager-owned buffers -> wait idle.
+//
+// Phase 4: storage buffers no longer live in this file. They are
+// vortyx::resource::VulkanBuffer objects (VkBuffer + VkDeviceMemory, RAII)
+// created through this backend's VulkanBufferProvider and tracked by the
+// Runtime's Resource Manager. execute() only binds the given buffers to the
+// descriptor set and dispatches; upload/download happen in the resource
+// layer (Buffer::write / Buffer::read).
 //
 // Everything is cleaned up in Impl::destroy(), which is idempotent and is
-// invoked on any failure path as well as from shutdown().
+// invoked on any failure path as well as from shutdown(). The provider is
+// reset FIRST so no new buffers can appear on a dying device.
 
 #include "core/compute/vulkan_backend.hpp"
 
@@ -18,6 +27,7 @@
 #include "core/compute/vector_add_spv.hpp"
 #include "core/device/vendor_names.hpp"
 #include "core/logger.hpp"
+#include "core/resource/vulkan_buffer.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -88,11 +98,19 @@ struct VulkanBackend::Impl {
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;  // freed with the pool
 
+    // Phase 4: buffer provider for the Resource Manager. Owns no Vulkan
+    // objects itself; the buffers it creates are owned by the resource
+    // registry and freed BEFORE this device is destroyed (Runtime::shutdown
+    // purges the ResourceManager first).
+    std::unique_ptr<vortyx::resource::VulkanBufferProvider> provider;
+
     std::uint32_t queue_family = 0;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory_properties{};
 
     void destroy() {  // idempotent, reverse order of creation
+        // Stop buffer creation on the dying device before anything else.
+        provider.reset();
         if (device != VK_NULL_HANDLE) {
             descriptor_set = VK_NULL_HANDLE;
             if (descriptor_pool != VK_NULL_HANDLE) {
@@ -148,9 +166,9 @@ bool VulkanBackend::initialize() {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "Vortyx";
-        app.applicationVersion = VK_MAKE_VERSION(0, 3, 0);
+        app.applicationVersion = VK_MAKE_VERSION(0, 4, 0);
         app.pEngineName = "VortyxRuntime";
-        app.engineVersion = VK_MAKE_VERSION(0, 3, 0);
+        app.engineVersion = VK_MAKE_VERSION(0, 4, 0);
         app.apiVersion = VK_API_VERSION_1_0;
 
         VkInstanceCreateInfo instance_info{};
@@ -394,6 +412,14 @@ bool VulkanBackend::initialize() {
             ok = false;
             break;
         }
+
+        // --- 7. Buffer resource provider (Phase 4) --------------------------
+        // Lets the Resource Manager allocate GPU storage (VkBuffer +
+        // VkDeviceMemory) on this device. Lives inside the Impl, so it can
+        // never outlive the VkDevice.
+        impl->provider =
+            std::make_unique<vortyx::resource::VulkanBufferProvider>(impl->device,
+                                                                    impl->memory_properties);
     } while (false);
 
     if (!ok) {
@@ -418,6 +444,8 @@ bool VulkanBackend::initialize() {
                         device_type_name(impl->properties.deviceType) +
                         ", Vulkan API " + std::to_string(major) + "." +
                         std::to_string(minor) + ")");
+        vortyx::log(vortyx::LogLevel::Info,
+                    "Vulkan buffer resource provider registered (Phase 4 resource layer)");
     }
     return true;
 }
@@ -430,6 +458,11 @@ void VulkanBackend::shutdown() {
     }
     initialized_ = false;
     unavailable_reason_ = "Vulkan backend was not initialized";
+}
+
+vortyx::resource::IBufferProvider* VulkanBackend::resource_provider() {
+    if (impl_ == nullptr || !initialized_ || impl_->provider == nullptr) return nullptr;
+    return impl_->provider.get();
 }
 
 vortyx::device::DeviceInfo VulkanBackend::device_info() const {
@@ -475,140 +508,64 @@ vortyx::device::DeviceInfo VulkanBackend::device_info() const {
     return info;
 }
 
-VectorAddResult VulkanBackend::execute(const VectorAddTask& task) {
-    VectorAddResult result;
+ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
+                                     const vortyx::resource::IBufferImpl& b,
+                                     vortyx::resource::IBufferImpl& c) {
     if (impl_ == nullptr || !initialized_) {
-        result.status = Status::NotInitialized;
-        result.error = "Vulkan backend is not initialized (call Runtime::initialize first)";
-        return result;
+        return ComputeResult{Status::NotInitialized,
+                             "Vulkan backend is not initialized (call Runtime::initialize first)"};
     }
-
-    const Status validation = validate_vector_add(task);
-    if (validation != Status::Ok) {
-        result.status = validation;
-        result.error = "invalid vector addition task (a.size=" +
-                       std::to_string(task.a.size()) + ", b.size=" +
-                       std::to_string(task.b.size()) + "); arrays must be non-empty and equal size";
-        return result;
-    }
-
     Impl* impl = impl_;
-    const std::size_t count = task.a.size();
-    const VkDeviceSize byte_size = static_cast<VkDeviceSize>(count) * sizeof(std::int32_t);
 
-    // Per-execution RAII buffer pair: destroyed when the scope ends, on
-    // every path (success or error), so GPU memory never leaks.
-    struct ScopedBuffer {
-        VkDevice device = VK_NULL_HANDLE;
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        ~ScopedBuffer() {
-            if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, buffer, nullptr);
-            if (memory != VK_NULL_HANDLE) vkFreeMemory(device, memory, nullptr);
-        }
-    };
-
-    const char* fail = nullptr;
-    std::string fail_detail;
-
-    auto create_buffer = [&](ScopedBuffer& out) -> bool {
-        out.device = impl->device;  // required by the RAII destructor
-        VkBufferCreateInfo buffer_info{};
-        buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buffer_info.size = byte_size;
-        buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        VkResult vk = vkCreateBuffer(impl->device, &buffer_info, nullptr, &out.buffer);
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkCreateBuffer failed";
-            fail_detail = vk_result_name(vk);
-            return false;
-        }
-
-        VkMemoryRequirements requirements{};
-        vkGetBufferMemoryRequirements(impl->device, out.buffer, &requirements);
-
-        std::int32_t memory_type = -1;
-        for (std::uint32_t t = 0; t < impl->memory_properties.memoryTypeCount; ++t) {
-            const bool bits_ok = (requirements.memoryTypeBits & (1u << t)) != 0;
-            const bool props_ok =
-                (impl->memory_properties.memoryTypes[t].propertyFlags &
-                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
-                0;
-            if (bits_ok && props_ok) {
-                memory_type = static_cast<std::int32_t>(t);
-                break;
-            }
-        }
-        if (memory_type < 0) {
-            fail = "Vulkan: no host-visible coherent memory type found for storage buffer";
-            return false;
-        }
-
-        VkMemoryAllocateInfo alloc_info{};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = requirements.size;
-        alloc_info.memoryTypeIndex = static_cast<std::uint32_t>(memory_type);
-
-        vk = vkAllocateMemory(impl->device, &alloc_info, nullptr, &out.memory);
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkAllocateMemory failed";
-            fail_detail = vk_result_name(vk);
-            return false;
-        }
-
-        vk = vkBindBufferMemory(impl->device, out.buffer, out.memory, 0);
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkBindBufferMemory failed";
-            fail_detail = vk_result_name(vk);
-            return false;
-        }
-        return true;
-    };
-
-    ScopedBuffer buf_a, buf_b, buf_c;
-    if (!create_buffer(buf_a) || !create_buffer(buf_b) || !create_buffer(buf_c)) {
-        result.status = Status::BackendError;
-        result.error = fail_detail.empty() ? std::string(fail) : std::string(fail) + " (" + fail_detail + ")";
-        return result;
+    // The buffers must belong to the vulkan backend. Anything else means a
+    // routing bug; reject it instead of binding foreign memory.
+    const vortyx::resource::VulkanBuffer* vk_a =
+        dynamic_cast<const vortyx::resource::VulkanBuffer*>(&a);
+    const vortyx::resource::VulkanBuffer* vk_b =
+        dynamic_cast<const vortyx::resource::VulkanBuffer*>(&b);
+    vortyx::resource::VulkanBuffer* vk_c = dynamic_cast<vortyx::resource::VulkanBuffer*>(&c);
+    if (vk_a == nullptr || vk_b == nullptr || vk_c == nullptr) {
+        return ComputeResult{Status::BackendError,
+                             "buffer does not belong to the vulkan backend"};
     }
 
-    // Upload inputs (host-visible + host-coherent memory: plain memcpy).
-    auto upload = [&](const ScopedBuffer& buf, const std::vector<std::int32_t>& data) -> bool {
-        void* mapped = nullptr;
-        const VkResult vk = vkMapMemory(impl->device, buf.memory, 0, byte_size, 0, &mapped);
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkMapMemory (upload) failed";
-            fail_detail = vk_result_name(vk);
-            return false;
-        }
-        std::memcpy(mapped, data.data(), static_cast<std::size_t>(byte_size));
-        vkUnmapMemory(impl->device, buf.memory);
-        return true;
-    };
-
-    if (!upload(buf_a, task.a) || !upload(buf_b, task.b)) {
-        result.status = Status::BackendError;
-        result.error = fail_detail.empty() ? std::string(fail) : std::string(fail) + " (" + fail_detail + ")";
-        return result;
+    // The buffers must have been allocated on THIS backend's device (Phase 4
+    // guards against mixing devices; multi-GPU aggregation is not a Phase 4
+    // feature).
+    if (vk_a->vk_device() != impl->device || vk_b->vk_device() != impl->device ||
+        vk_c->vk_device() != impl->device) {
+        return ComputeResult{Status::BackendError,
+                             "buffer was not allocated on this backend's Vulkan device"};
     }
 
-    // Bind buffers to the descriptor set.
-    VkDescriptorBufferInfo buffer_infos[3] = {
-        {buf_a.buffer, 0, VK_WHOLE_SIZE},
-        {buf_b.buffer, 0, VK_WHOLE_SIZE},
-        {buf_c.buffer, 0, VK_WHOLE_SIZE},
+    // Shared task rules: int32 elements, equal non-zero counts, Read inputs,
+    // Write output. Enforced here so direct backend users cannot bypass it.
+    std::string validation_error;
+    const Status validation =
+        validate_vector_add_buffers(a.desc(), b.desc(), c.desc(), validation_error);
+    if (validation != Status::Ok) {
+        return ComputeResult{validation, validation_error};
+    }
+
+    const std::uint32_t count_u32 = static_cast<std::uint32_t>(a.desc().element_count);
+
+    // Bind the resource-owned buffers to the descriptor set. The set itself
+    // is the same fixed 3-binding set as Phase 3; only the bindings' targets
+    // (Resource-Manager-owned storage) change per execution.
+    const VkDescriptorBufferInfo buffer_infos[3] = {
+        {vk_a->vk_buffer(), 0, VK_WHOLE_SIZE},
+        {vk_b->vk_buffer(), 0, VK_WHOLE_SIZE},
+        {vk_c->vk_buffer(), 0, VK_WHOLE_SIZE},
     };
 
     VkWriteDescriptorSet writes[3] = {};
-    for (std::uint32_t b = 0; b < 3; ++b) {
-        writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[b].dstSet = impl->descriptor_set;
-        writes[b].dstBinding = b;
-        writes[b].descriptorCount = 1;
-        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[b].pBufferInfo = &buffer_infos[b];
+    for (std::uint32_t binding = 0; binding < 3; ++binding) {
+        writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[binding].dstSet = impl->descriptor_set;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorCount = 1;
+        writes[binding].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[binding].pBufferInfo = &buffer_infos[binding];
     }
     vkUpdateDescriptorSets(impl->device, 3, writes, 0, nullptr);
 
@@ -619,22 +576,17 @@ VectorAddResult VulkanBackend::execute(const VectorAddTask& task) {
 
     VkResult vk = vkResetCommandBuffer(impl->command_buffer, 0);
     if (vk != VK_SUCCESS) {
-        result.status = Status::BackendError;
-        result.error = "Vulkan: vkResetCommandBuffer failed";
-        return result;
+        return ComputeResult{Status::BackendError, "Vulkan: vkResetCommandBuffer failed"};
     }
     vk = vkBeginCommandBuffer(impl->command_buffer, &begin_info);
     if (vk != VK_SUCCESS) {
-        result.status = Status::BackendError;
-        result.error = "Vulkan: vkBeginCommandBuffer failed";
-        return result;
+        return ComputeResult{Status::BackendError, "Vulkan: vkBeginCommandBuffer failed"};
     }
 
     vkCmdBindPipeline(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, impl->pipeline);
     vkCmdBindDescriptorSets(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             impl->pipeline_layout, 0, 1, &impl->descriptor_set, 0, nullptr);
 
-    const std::uint32_t count_u32 = static_cast<std::uint32_t>(count);
     vkCmdPushConstants(impl->command_buffer, impl->pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t), &count_u32);
 
@@ -649,34 +601,17 @@ VectorAddResult VulkanBackend::execute(const VectorAddTask& task) {
 
     vk = vkQueueSubmit(impl->queue, 1, &submit_info, VK_NULL_HANDLE);
     if (vk != VK_SUCCESS) {
-        result.status = Status::BackendError;
-        result.error = "Vulkan: vkQueueSubmit failed";
-        return result;
+        return ComputeResult{Status::BackendError, "Vulkan: vkQueueSubmit failed"};
     }
     vk = vkQueueWaitIdle(impl->queue);
     if (vk != VK_SUCCESS) {
-        result.status = Status::BackendError;
-        result.error = "Vulkan: vkQueueWaitIdle failed";
-        return result;
+        return ComputeResult{Status::BackendError, "Vulkan: vkQueueWaitIdle failed"};
     }
 
-    // Read back C.
-    {
-        void* mapped = nullptr;
-        vk = vkMapMemory(impl->device, buf_c.memory, 0, byte_size, 0, &mapped);
-        if (vk != VK_SUCCESS) {
-            result.status = Status::BackendError;
-            result.error = "Vulkan: vkMapMemory (readback) failed";
-            return result;
-        }
-        result.data.resize(count);
-        std::memcpy(result.data.data(), mapped, static_cast<std::size_t>(byte_size));
-        vkUnmapMemory(impl->device, buf_c.memory);
-    }
-
-    result.status = Status::Ok;
-    result.error.clear();
-    return result;
+    // The result now lives in the output buffer's device memory; the caller
+    // downloads it explicitly through Buffer::read (Phase 4 separates compute
+    // from data movement).
+    return ComputeResult{Status::Ok, {}};
 }
 
 #else  // !VORTYX_HAS_VULKAN — stub keeps Runtime/tests working without Vulkan
@@ -692,18 +627,23 @@ bool VulkanBackend::initialize() {
 
 void VulkanBackend::shutdown() {}
 
+vortyx::resource::IBufferProvider* VulkanBackend::resource_provider() {
+    return nullptr;  // stub build offers no GPU buffer provider
+}
+
 vortyx::device::DeviceInfo VulkanBackend::device_info() const {
     vortyx::device::DeviceInfo info;
     info.backend = "vulkan";
     return info;
 }
 
-VectorAddResult VulkanBackend::execute(const VectorAddTask& task) {
-    (void)task;
-    VectorAddResult result;
-    result.status = Status::BackendUnavailable;
-    result.error = unavailable_reason_;
-    return result;
+ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
+                                     const vortyx::resource::IBufferImpl& b,
+                                     vortyx::resource::IBufferImpl& c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    return ComputeResult{Status::BackendUnavailable, unavailable_reason_};
 }
 
 #endif  // VORTYX_HAS_VULKAN
