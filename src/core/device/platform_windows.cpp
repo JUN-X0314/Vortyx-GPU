@@ -12,8 +12,10 @@
 
 #include <intrin.h>  // __cpuid
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -72,7 +74,13 @@ std::string cpuid_brand_string() {
     __cpuid(reinterpret_cast<int*>(brand + 0), 0x80000002u);
     __cpuid(reinterpret_cast<int*>(brand + 16), 0x80000003u);
     __cpuid(reinterpret_cast<int*>(brand + 32), 0x80000004u);
-    return std::string(brand);
+
+    // The CPUID brand string is space-padded to 48 characters.
+    std::string result(brand);
+    const std::size_t last = result.find_last_not_of(' ');
+    if (last == std::string::npos) return {};
+    result.erase(last + 1);
+    return result;
 }
 
 // Counts physical processor cores via GetLogicalProcessorInformation.
