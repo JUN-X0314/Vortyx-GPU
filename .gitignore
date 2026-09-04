@@ -43,6 +43,8 @@
 build/
 Build/
 build-*/
+out/
+Out/
 
 # CMake generated files
 CMakeFiles/
@@ -63,6 +65,11 @@ vcpkg_installed/
 
 # debug information files
 *.dwo
+
+# IDE files
+.vs/
+.vscode/
+.idea/
 
 # test output & cache
 Testing/
