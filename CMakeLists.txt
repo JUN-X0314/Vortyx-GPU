@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -24,8 +24,19 @@ endif()
 # New modules should be added to this library (or new libraries linked by the app).
 add_library(vortyx_core STATIC
     src/core/logger.cpp
+    src/core/device/device.cpp
+    src/core/device/discovery.cpp
+    src/core/device/platform_windows.cpp
+    src/core/device/platform_linux.cpp
+    src/core/device/platform_fallback.cpp
 )
 target_include_directories(vortyx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# GPU discovery on Windows uses DXGI (part of the Windows OS/SDK, no external
+# dependency). Only linked on Windows targets.
+if(WIN32)
+    target_link_libraries(vortyx_core PRIVATE dxgi)
+endif()
 
 # Main executable
 add_executable(vortyx

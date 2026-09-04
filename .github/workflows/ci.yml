@@ -28,3 +28,17 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Run vortyx (informational hardware discovery output)
+        shell: bash
+        run: |
+          if [ -f build/Release/vortyx.exe ]; then
+            ./build/Release/vortyx.exe
+          elif [ -f build/vortyx ]; then
+            ./build/vortyx
+          elif [ -f build/vortyx.exe ]; then
+            ./build/vortyx.exe
+          else
+            echo "vortyx executable not found"
+            exit 1
+          fi
