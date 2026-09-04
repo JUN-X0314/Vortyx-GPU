@@ -563,7 +563,7 @@ int main() {
         std::atomic<bool> all_accepted{true};
 
         for (int t = 0; t < kThreads; ++t) {
-            producers.emplace_back([t, &cq, &ids, &ids_mutex, &all_accepted] {
+            producers.emplace_back([t, kPerThread, &cq, &ids, &ids_mutex, &all_accepted] {
                 for (int i = 0; i < kPerThread; ++i) {
                     VectorAddTask task;
                     const std::int32_t base = static_cast<std::int32_t>(t * 1000 + i);
