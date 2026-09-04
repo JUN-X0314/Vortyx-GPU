@@ -6,26 +6,29 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 5 (v0.5.0) — Virtual GPU Interface
+## Current Phase: Phase 6 (v0.6.0) — Task Queue & Async Execution
 
-Phase 5 gives applications **one logical compute device**: a Virtual GPU. An application executes compute tasks through Vortyx without knowing — or touching — Vulkan, DXGI, queue families, memory types or buffer internals. A Virtual GPU is **not a physical GPU** and does not create any new compute capability; it is an abstraction layer that represents one explicitly chosen execution backend as a single logical object.
+Phase 6 adds a **real Task Queue** on top of the Virtual GPU: an application can submit several compute tasks up front, and a dedicated worker execution context processes them one at a time, asynchronously and strictly in FIFO order. Each task gets a unique id, an observable lifecycle (`Queued → Running → Completed/Failed`), and a queryable result. The Task Queue is **not a scheduler**: it never compares backends, never picks devices, and always uses exactly the one Virtual GPU it was initialized with.
 
 ```
-Application → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
+Application → Task Queue → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
 ```
 
-**Implemented in Phase 5:**
+**Implemented in Phase 6:**
 
-- **`vortyx::vgpu::VirtualGpu`** (`src/core/vgpu/`): the application-facing logical GPU. It exclusively owns one Compute Runtime (`std::unique_ptr`), binds itself to ONE explicitly configured backend, and forwards execution to it. Contains no Vulkan, DXGI or platform types — backend independence is structural, not conventional.
-- **Explicit backend selection, zero automatic choice**: the backend is fixed in the description (`VirtualGpuDesc::backend`, default `"cpu"`). There is NO scheduler, NO "GPU if available", NO silent fallback. If a Vulkan Virtual GPU is requested on a machine without a usable Vulkan device, its `execute()` honestly fails with `Status::BackendUnavailable` and the real reason — the CPU path stays available through a separately created CPU Virtual GPU.
-- **Honest lifecycle states**: `Uninitialized → Ready → ShutDown`. `execute()` before `initialize()` or after `shutdown()` fails with a precise `Status::NotInitialized` message (the two cases are distinguishable). An *unknown* backend name fails early at `initialize()`; a *known-but-unavailable* backend initializes normally and its true condition is exposed through `backend_available()` / `backend_unavailable_reason()` / `device_info()`.
-- **Task and resource execution**: `execute(VectorAddTask)` returns the computed vector; `execute(a, b, c)` runs directly on Buffer resources created through the Virtual GPU's Resource Manager. Buffers belonging to a different backend than the Virtual GPU's configuration are rejected with `Status::InvalidInput` — a Virtual GPU is one explicit execution target and never silently executes elsewhere.
-- **Ownership and safety**: move-only (copying a live execution context is forbidden), the moved-from object is fully inert, `shutdown()` is safe to call multiple times, and re-initialization after `shutdown()` builds a fresh Runtime. Buffer handles that outlive their Virtual GPU fail cleanly and release as a no-op (Phase 4 contract).
-- **Phase 2/3/4 APIs unchanged**: Hardware Discovery, `Runtime` and the Resource Manager keep their public APIs and all their tests; the Virtual GPU is a layer on top, not a replacement.
+- **`vortyx::queue::TaskQueue`** (`src/core/queue/`): FIFO task submission + asynchronous execution on one worker thread. `enqueue()` returns immediately with a `TaskId` — it never waits for execution. The worker waits on a condition variable (no busy-waiting), pops tasks strictly in FIFO order, executes them through the bound Virtual GPU, and records state + result per task.
+- **Task model**: `QueuedTask` is the minimal "work the bound Virtual GPU can execute" abstraction; Phase 6 ships exactly one implementation (`VectorAddQueuedTask`, wrapping the Phase 3 `VectorAddTask` unchanged). Future task kinds derive from it without changing the queue.
+- **Task identity**: `TaskId` follows the Phase 4 `ResourceId` pattern — 64-bit monotonic, 0 reserved as invalid, **never reused**, so a stale id can never alias a newer task (even across queue re-initialization).
+- **Observable lifecycle**: `task_state(id)` / `task_snapshot(id)` (state + recorded result, returned by value) / `wait(id)` (blocks until terminal) / `wait_for(id, timeout)`. There is deliberately no `Cancelled` state: cancelling queued work is not implemented in Phase 6, and claiming it would be a lie.
+- **Thread safety by structure**: one mutex guards all bookkeeping; the worker releases the mutex before executing (a long compute run never blocks submission or queries, and nothing below can deadlock against the queue's lock). Copying AND moving are deleted — the worker and every waiter hold `this`, so a queue has exactly one address for its whole life.
+- **Shutdown policy A (drain)**: `shutdown()` refuses new tasks, lets the worker finish every accepted task FIFO, joins the thread, then returns. Safe to call multiple times and concurrently; the destructor always joins the worker (no leaked thread, no `std::terminate`). Documented order: **queue shuts down before its Virtual GPU** — and if the caller violates that order, pending tasks fail honestly instead of faking success.
+- **Honest failures**: a task that cannot run (unavailable backend, shut-down Virtual GPU, invalid data caught by the Runtime) ends `Failed` with the real `Status` and reason — the queue never reports a fake `Completed`, never falls back to another backend.
 
-**Not implemented yet** (later phases): Task Queue / async execution (Phase 6), Scheduler (Phase 7), Multi-GPU, memory pooling / suballocation, network workers, distributed computing, benchmarks, FPGA/own hardware.
+**Phase 5 (unchanged)**: the Virtual GPU remains the single logical compute device per explicitly chosen backend (`"cpu"`, `"vulkan"`), with no automatic selection and no silent fallback; its API and tests are exactly as delivered in v0.5.0.
 
-## Virtual GPU concepts
+**Not implemented yet** (later phases): Scheduler (Phase 7), Multi-GPU, memory pooling / suballocation, network workers, distributed computing, benchmarks, FPGA/own hardware.
+
+## Virtual GPU concepts (Phase 5, unchanged and still in force)
 
 | Concept | Meaning |
 |---------|---------|
@@ -60,6 +63,40 @@ gpu.shutdown();
 
 Requesting `"vulkan"` on a GPU-less machine works the same way: `initialize()` succeeds (a known backend is a valid configuration), `backend_available()` returns `false` with the honest reason, and `execute()` returns `Status::BackendUnavailable` — it never pretends to run on a GPU and never silently falls back to the CPU. Want CPU compute? Create a CPU Virtual GPU explicitly.
 
+## Task Queue concepts (Phase 6)
+
+| Concept | Meaning |
+|---------|---------|
+| TaskQueue | One FIFO queue bound to exactly ONE Virtual GPU (`initialize(gpu)`). Not a scheduler: no device choice, no priorities, no reordering — ever |
+| TaskId | Unique, monotonically increasing, never reused (0 = invalid). Stays safe across shutdown/re-initialization |
+| TaskState | `Queued` (accepted, waiting) → `Running` (worker executing it now) → `Completed` / `Failed` (terminal). No `Cancelled`: not implemented in Phase 6 |
+| `enqueue(task)` | Validates the task, appends it to the FIFO, returns `EnqueueResult{ id, status, error }` immediately — never blocks on execution |
+| `task_state(id)` / `task_snapshot(id)` | Non-blocking state query; snapshot returns state + recorded result by value (result is meaningful only in a terminal state) |
+| `wait(id)` / `wait_for(id, timeout)` | Block until the task is terminal (or at most `timeout`); already-terminal tasks return immediately; unknown ids return `Invalid` |
+| Worker | Exactly ONE worker thread per queue: condition-variable wait (no busy-wait), pop front, execute **without holding the queue lock**, record result, repeat |
+| Shutdown | Policy A: refuse new tasks → drain every accepted task FIFO → join worker. Double/concurrent shutdown safe; destructor joins the worker |
+| Ownership | The queue REFERENCES its Virtual GPU (non-owning). Contract: shut the queue down before the Virtual GPU; violating it fails tasks honestly instead of crashing |
+
+Example — the Phase 6 application flow (this is what `main.cpp` and the Task Queue tests exercise):
+
+```cpp
+vortyx::vgpu::VirtualGpu gpu;
+gpu.initialize();                      // explicit cpu backend (default)
+
+vortyx::queue::TaskQueue queue;
+queue.initialize(gpu);                 // binds the queue to THIS Virtual GPU
+
+vortyx::queue::EnqueueResult r = queue.enqueue(task);   // returns immediately
+vortyx::queue::TaskState state = queue.wait(r.id);      // blocks until terminal
+auto snap = queue.task_snapshot(r.id);
+if (snap.state == vortyx::queue::TaskState::Completed) {
+    // snap.result.data == A+B
+}
+
+queue.shutdown();                      // worker joined, all tasks processed
+gpu.shutdown();                        // Virtual GPU shuts down AFTER the queue
+```
+
 ## Resource concepts (Phase 4, unchanged and still in force)
 
 | Concept | Meaning |
@@ -81,6 +118,7 @@ Requesting `"vulkan"` on a GPU-less machine works the same way: `initialize()` s
 | GPU compute (Phase 3) | Vulkan (compute pipeline) | Vulkan (compute pipeline) |
 | Resource management (Phase 4) | Shared abstraction over host memory and Vulkan device memory | same |
 | Virtual GPU (Phase 5) | Backend-agnostic logical device over the Runtime (`cpu` / `vulkan`) | same |
+| Task Queue (Phase 6) | FIFO queue + one worker thread over any explicitly chosen Virtual GPU | same |
 
 - DXGI is **discovery-only**; GPU computation goes through the Vulkan backend. The Virtual GPU never touches DXGI or Vulkan.
 - Vulkan was chosen because it is free/open-source, Windows-first friendly, compute-capable without any windowing system, and aligns with the long-term Vortyx roadmap.
@@ -130,8 +168,8 @@ Example output — **actual devices depend on the machine** (example: Linux box,
 ```
 ========================================
   Vortyx GPU
-  Version: 0.5.0
-  Phase:   5 (Virtual GPU Interface)
+  Version: 0.6.0
+  Phase:   6 (Task Queue & Async Execution)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -151,6 +189,26 @@ Example output — **actual devices depend on the machine** (example: Linux box,
 [INFO] Resource verification: vulkan buffer output matches cpu buffer output.
 [INFO] Virtual GPU shut down.
 [INFO] Post-shutdown execute() refused as expected: NotInitialized - Virtual GPU is shut down (call initialize() again before execute())
+[INFO] Task Queue initialized (worker: 1 thread, execution target: 'cpu', FIFO).
+[INFO] Task Queue ready: state=Ready, execution target='cpu', policy: FIFO, worker: 1 thread.
+[INFO] Enqueued task 1 (4 elements, worker executes FIFO in the background).
+[INFO] Enqueued task 2 (4 elements, worker executes FIFO in the background).
+[INFO] Enqueued task 3 (4 elements, worker executes FIFO in the background).
+[INFO] Enqueued task 4 (4 elements, worker executes FIFO in the background).
+[INFO] Task 1: state=Completed, C = A + B (11 22 33 44) [verified]
+[INFO] Task 2: state=Completed, C = A + B (12 24 36 48) [verified]
+[INFO] Task 3: state=Completed, C = A + B (13 26 39 52) [verified]
+[INFO] Task 4: state=Completed, C = A + B (14 28 42 56) [verified]
+[INFO] Task Queue verification: all queued tasks completed FIFO with correct results.
+[INFO] Task Queue shut down (worker joined, all accepted tasks processed).
+[INFO] Queue shut down: state=ShutDown, task states remain queryable until the queue is destroyed.
+[INFO] Virtual GPU shut down.
+[INFO] Hardware discovery: implemented (Phase 2).
+[INFO] Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.
+[INFO] Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.
+[INFO] Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.
+[INFO] Task Queue: implemented (Phase 6) - FIFO task submission, one worker thread, asynchronous execution, per-task id/state/result, drain-on-shutdown.
+[INFO] Not implemented yet: Scheduler (Phase 7), Multi-GPU, Distributed Computing.
 ```
 
 On a machine without any Vulkan device (or in a CPU-only build), the program instead prints `Vulkan Virtual GPU is not usable on this system: <reason>` and `No fallback was attempted: the CPU Virtual GPU above ran on the explicitly configured cpu backend.` — and continues with the CPU results.
@@ -184,11 +242,15 @@ Vortyx-GPU/
 │       │   ├── resource_manager.*  # Registry, providers, stats, shutdown purge
 │       │   ├── cpu_buffer.*        # Host-memory buffer implementation
 │       │   └── vulkan_buffer.*     # VkBuffer + VkDeviceMemory implementation (Vulkan builds)
-│       └── vgpu/                   # Phase 5 Virtual GPU Interface
-│           └── virtual_gpu.hpp/.cpp  # VirtualGpu (logical device), VirtualGpuDesc, State
+│       ├── vgpu/                   # Phase 5 Virtual GPU Interface
+│       │   └── virtual_gpu.hpp/.cpp  # VirtualGpu (logical device), VirtualGpuDesc, State
+│       └── queue/                  # Phase 6 Task Queue & Async Execution
+│           └── task_queue.hpp/.cpp   # TaskQueue (FIFO + 1 worker), QueuedTask, TaskId, TaskState
 └── tests/
-    ├── test_vgpu.cpp               # Virtual GPU CPU path: must pass everywhere
-    ├── test_vgpu_gpu.cpp           # Virtual GPU GPU path: real tests when Vulkan available
+    ├── test_taskqueue.cpp         # Task Queue CPU path: must pass everywhere
+    ├── test_taskqueue_gpu.cpp     # Task Queue GPU path: real tests when Vulkan available
+    ├── test_vgpu.cpp              # Virtual GPU CPU path: must pass everywhere
+    ├── test_vgpu_gpu.cpp          # Virtual GPU GPU path: real tests when Vulkan available
     └── ... (Phase 1/2/3/4 tests unchanged)
 ```
 
@@ -200,7 +262,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.5.0 |
+| VersionTest | Version constants match 0.6.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -209,6 +271,8 @@ ctest --test-dir build -C Release --output-on-failure
 | ResourceGpuTest | When a Vulkan device exists: real `VkBuffer`/`VkDeviceMemory` allocation through the resource layer, `memory_location() == Device` honesty, full create→write→execute→read→release cycles, bit-exact CPU-vs-GPU resource results, oversized-transfer rejection, mixed-backend rejection, shutdown with live GPU buffers, re-initialization. Without a device: explicit SKIP note (never faked success) |
 | VirtualGpuTest | Virtual GPU CPU path (every system): fresh-object state and refused operations, CPU initialization, vector addition vs reference, invalid tasks, unknown-backend early failure + recovery, idempotent re-init / refused reconfiguration, resource-based execution through `resources()`, dead-buffer rejection, honest known-but-unavailable backend behavior (no silent fallback), shutdown/re-init cycles, move semantics (exactly-once ownership, inert moved-from), buffer handles outliving their Virtual GPU |
 | VirtualGpuGpuTest | When a Vulkan device exists: real execution through a Vulkan Virtual GPU, bit-exact match against an independently executed CPU Virtual GPU, `Device` memory honesty, cross-backend buffer rejection in both directions, determinism, shutdown with live resources + re-initialization. Without a device: explicit SKIP note (never faked success) |
+| TaskQueueTest | Task Queue CPU path (every system): fresh-object refusals, init with non-Ready Virtual GPU refused, double-init refused, enqueue/wait/result correctness, id uniqueness/monotonicity, deterministic async proof (gated work item: `Running` observable, `enqueue()` non-blocking while the worker is busy, `wait_for` timeout path), FIFO order via order-recording work items, honest failure propagation (custom failing task, Runtime-rejected data, enqueue-time validation, null task), queue on an unavailable backend (adaptive: completes on real Vulkan, fails `BackendUnavailable` without one), shutdown drain policy, enqueue-after-shutdown refusal, records queryable after shutdown, double shutdown, Virtual-GPU-shutdown-first safety, destructor join, concurrent enqueue from 3 threads with distinct results, re-initialization cycles with ids never reused |
+| TaskQueueGpuTest | When a Vulkan device exists: multiple VectorAddTasks queued on a Vulkan Virtual GPU, bit-exact match against independently executed CPU references, FIFO execution order on the GPU queue, determinism, queue-before-gpu shutdown order, enqueue refusal after shutdown. Without a device: explicit SKIP note (never faked success) |
 
 No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs pass the full suite.
 
@@ -219,8 +283,8 @@ No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs 
 | 0.2 | Hardware Discovery (CPU/GPU detection) | Implemented |
 | 0.3 | Basic Compute Runtime (CPU backend + Vulkan GPU backend, Vector Addition) | Implemented |
 | 0.4 | Compute Resource & Memory Management (Buffer resources, Resource Manager, RAII ownership) | Implemented |
-| 0.5 | Virtual GPU Interface (logical device over explicit backends) | **Implemented (current)** |
-| 0.6 | Task Queue and Async Execution | Planned |
+| 0.5 | Virtual GPU Interface (logical device over explicit backends) | Implemented |
+| 0.6 | Task Queue and Async Execution (FIFO queue, one worker thread) | **Implemented (current)** |
 | 0.7 | Basic Scheduler | Planned |
 | 1.0 | Local GPU Computing Platform | Planned |
 

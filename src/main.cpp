@@ -10,6 +10,7 @@
 #include "core/resource/resource.hpp"
 #include "core/resource/resource_manager.hpp"
 #include "core/vgpu/virtual_gpu.hpp"
+#include "core/queue/task_queue.hpp"
 
 #ifndef VORTYX_BUILD_CONFIG
 #define VORTYX_BUILD_CONFIG "Unknown"
@@ -125,7 +126,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   5 (Virtual GPU Interface)" << std::endl;
+    std::cout << "  Phase:   6 (Task Queue & Async Execution)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -312,11 +313,90 @@ int main() {
                         to_string(refused.status) + " - " + refused.error);
     }
 
+    // =====================================================================
+    // 3. Task Queue (Phase 6): asynchronous FIFO execution on ONE Virtual
+    //    GPU. Tasks are submitted with enqueue() (never blocking), executed
+    //    one at a time by the queue's worker thread, and queried through
+    //    their TaskId. The queue is NOT a scheduler: it always uses the
+    //    Virtual GPU it was given - here, the explicit CPU one.
+    // =====================================================================
+    {
+        vortyx::vgpu::VirtualGpu gpu;  // backend defaults to "cpu" (explicit choice)
+        if (gpu.initialize() != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error, "CPU Virtual GPU failed to initialize.");
+            return 1;
+        }
+
+        vortyx::queue::TaskQueue queue;
+        if (queue.initialize(gpu) != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error, "Task Queue failed to initialize.");
+            gpu.shutdown();
+            return 1;
+        }
+        vortyx::log(vortyx::LogLevel::Info,
+                    "Task Queue ready: state=" + std::string(vortyx::queue::to_string(queue.state())) +
+                        ", execution target='" + gpu.backend_name() + "', policy: FIFO, worker: 1 thread.");
+
+        // Submit several tasks with distinct data; enqueue() returns
+        // immediately with a TaskId - it never waits for execution.
+        std::vector<vortyx::queue::TaskId> ids;
+        std::vector<std::vector<std::int32_t>> expected;
+        for (int t = 0; t < 4; ++t) {
+            vortyx::compute::VectorAddTask task;
+            const std::int32_t base = static_cast<std::int32_t>(t + 1);
+            task.a = {base, base * 2, base * 3, base * 4};
+            task.b = {10, 20, 30, 40};
+            expected.push_back({task.a[0] + task.b[0], task.a[1] + task.b[1],
+                                task.a[2] + task.b[2], task.a[3] + task.b[3]});
+            const vortyx::queue::EnqueueResult r = queue.enqueue(task);
+            if (r.status != vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Error,
+                            std::string("Task Queue enqueue failed: ") + r.error);
+                break;
+            }
+            ids.push_back(r.id);
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Enqueued task " + std::to_string(r.id) + " (4 elements, worker executes FIFO in the background).");
+        }
+
+        // Wait for every task and verify its result against A+B.
+        bool all_ok = true;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            const vortyx::queue::TaskState state = queue.wait(ids[i]);
+            const vortyx::queue::TaskSnapshot snap = queue.task_snapshot(ids[i]);
+            const bool completed =
+                state == vortyx::queue::TaskState::Completed &&
+                snap.result.status == vortyx::compute::Status::Ok &&
+                snap.result.data == expected[i];
+            all_ok = all_ok && completed;
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Task " + std::to_string(ids[i]) + ": state=" +
+                            vortyx::queue::to_string(state) + ", C = A + B (" +
+                            join_values(snap.result.data, 8) + ")" +
+                            (completed ? " [verified]" : " [VERIFICATION FAILED]") +
+                            (state == vortyx::queue::TaskState::Failed
+                                 ? " - " + snap.result.error
+                                 : ""));
+        }
+        vortyx::log(vortyx::LogLevel::Info,
+                    all_ok ? "Task Queue verification: all queued tasks completed FIFO with correct results."
+                           : "Task Queue verification: MISMATCH detected!");
+
+        // Documented shutdown order: queue first (worker joined, every
+        // accepted task processed), Virtual GPU second.
+        queue.shutdown();
+        vortyx::log(vortyx::LogLevel::Info,
+                    "Queue shut down: state=" + std::string(vortyx::queue::to_string(queue.state())) +
+                        ", task states remain queryable until the queue is destroyed.");
+        gpu.shutdown();
+    }
+
     vortyx::log(vortyx::LogLevel::Info, "Hardware discovery: implemented (Phase 2).");
     vortyx::log(vortyx::LogLevel::Info, "Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.");
     vortyx::log(vortyx::LogLevel::Info, "Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Task Queue (Phase 6), Scheduler (Phase 7), Multi-GPU, Distributed Computing.");
+    vortyx::log(vortyx::LogLevel::Info, "Task Queue: implemented (Phase 6) - FIFO task submission, one worker thread, asynchronous execution, per-task id/state/result, drain-on-shutdown.");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Scheduler (Phase 7), Multi-GPU, Distributed Computing.");
 
     return 0;
 }

@@ -26,6 +26,7 @@
 
 #include "core/compute/vector_add_spv.hpp"
 #include "core/device/vendor_names.hpp"
+#include "core/version.hpp"
 #include "core/logger.hpp"
 #include "core/resource/vulkan_buffer.hpp"
 
@@ -166,9 +167,9 @@ bool VulkanBackend::initialize() {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "Vortyx";
-        app.applicationVersion = VK_MAKE_VERSION(0, 5, 0);
+        app.applicationVersion = VK_MAKE_VERSION(VORTYX_VERSION_MAJOR, VORTYX_VERSION_MINOR, VORTYX_VERSION_PATCH);
         app.pEngineName = "VortyxRuntime";
-        app.engineVersion = VK_MAKE_VERSION(0, 5, 0);
+        app.engineVersion = VK_MAKE_VERSION(VORTYX_VERSION_MAJOR, VORTYX_VERSION_MINOR, VORTYX_VERSION_PATCH);
         app.apiVersion = VK_API_VERSION_1_0;
 
         VkInstanceCreateInfo instance_info{};

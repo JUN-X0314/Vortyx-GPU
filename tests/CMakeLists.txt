@@ -52,3 +52,18 @@ add_test(NAME VirtualGpuTest COMMAND test_vgpu)
 add_executable(test_vgpu_gpu test_vgpu_gpu.cpp)
 target_link_libraries(test_vgpu_gpu PRIVATE vortyx_core)
 add_test(NAME VirtualGpuGpuTest COMMAND test_vgpu_gpu)
+
+# Phase 6: Task Queue & Async Execution.
+# - CPU queue tests must pass on every system (including GPU-less machines
+#   and CPU-only builds): lifecycle, FIFO, async execution, state
+#   transitions, failure propagation, shutdown/drain, thread safety.
+# - GPU queue tests run for real when a Vulkan device is available; on
+#   systems without one they exit with an explicit SKIP note (never a fake
+#   success).
+add_executable(test_taskqueue test_taskqueue.cpp)
+target_link_libraries(test_taskqueue PRIVATE vortyx_core)
+add_test(NAME TaskQueueTest COMMAND test_taskqueue)
+
+add_executable(test_taskqueue_gpu test_taskqueue_gpu.cpp)
+target_link_libraries(test_taskqueue_gpu PRIVATE vortyx_core)
+add_test(NAME TaskQueueGpuTest COMMAND test_taskqueue_gpu)
