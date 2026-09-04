@@ -23,6 +23,7 @@ const char* device_type_name(DeviceType type) {
     switch (type) {
         case DeviceType::Cpu: return "CPU";
         case DeviceType::Gpu: return "GPU";
+        case DeviceType::SoftwareGpu: return "Software GPU";
         default: return "Unknown device";
     }
 }
@@ -45,7 +46,7 @@ std::string describe(const DeviceInfo& device) {
         if (device.memory_bytes.has_value()) {
             oss << " | RAM " << format_bytes(*device.memory_bytes);
         }
-    } else if (device.type == DeviceType::Gpu) {
+    } else if (device.type == DeviceType::Gpu || device.type == DeviceType::SoftwareGpu) {
         if (device.memory_bytes.has_value()) {
             oss << " | VRAM " << format_bytes(*device.memory_bytes);
         }

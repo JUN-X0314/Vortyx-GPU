@@ -20,6 +20,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Linux: the Vulkan loader (libvulkan-dev) plus Mesa's lavapipe
+      # software Vulkan implementation (mesa-vulkan-drivers) let the GPU
+      # compute tests run for real on the CI runner (software device).
+      - name: Install Vulkan loader + software device (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers
+
+      # Windows: try to install the Vulkan SDK so the GPU backend compiles.
+      # Runner machines have no Vulkan ICD, so GPU tests will report
+      # "unavailable" there and the CPU path is verified instead.
+      - name: Install Vulkan SDK (Windows, best effort)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: choco install vulkan-sdk -y --no-progress
+
       - name: Configure (CMake)
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
@@ -29,7 +44,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
-      - name: Run vortyx (informational hardware discovery output)
+      - name: Run vortyx (informational discovery + compute output)
         shell: bash
         run: |
           if [ -f build/Release/vortyx.exe ]; then

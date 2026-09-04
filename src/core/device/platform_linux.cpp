@@ -172,7 +172,7 @@ DiscoveryResult discover_gpus_platform() {
         gpu.type = DeviceType::Gpu;
         gpu.backend = "linux-sysfs";
 
-        const std::string vendor = pci_vendor_name(static_cast<std::uint16_t>(vendor_id));
+        const std::string vendor = pci_vendor_name(static_cast<std::uint32_t>(vendor_id));
         if (!vendor.empty()) {
             gpu.vendor = vendor;
         } else {

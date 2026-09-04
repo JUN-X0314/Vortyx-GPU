@@ -1,0 +1,30 @@
+#version 450
+
+// Vortyx Phase 3: Vector Addition compute shader.
+// Computes C[i] = A[i] + B[i] for i in [0, count).
+//
+// One workgroup processes LOCAL_SIZE_X elements; the dispatch uses
+// ceil(count / LOCAL_SIZE_X) workgroups and this guard rejects the
+// out-of-range invocations of the last workgroup.
+//
+// Regenerate SPIR-V (requires glslangValidator or glslc from the Vulkan SDK):
+//   glslangValidator -V --target-env vulkan1.0 shaders/vector_add.comp -o vector_add.spv
+// The compiled SPIR-V is embedded into the binary via
+// src/core/compute/vector_add_spv.hpp (see scripts/embed_spv.py).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer InA { int in_a[]; };
+layout(std430, binding = 1) buffer InB { int in_b[]; };
+layout(std430, binding = 2) buffer OutC { int out_c[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint count;  // number of elements (uint32)
+} pc;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index < pc.count) {
+        out_c[index] = in_a[index] + in_b[index];
+    }
+}

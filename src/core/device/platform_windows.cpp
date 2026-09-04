@@ -180,7 +180,7 @@ DiscoveryResult discover_gpus_platform() {
 
         gpu.name = utf8_from_wide(desc.Description);
 
-        const std::string vendor = pci_vendor_name(static_cast<std::uint16_t>(desc.VendorId));
+        const std::string vendor = pci_vendor_name(desc.VendorId);
         if (!vendor.empty()) {
             gpu.vendor = vendor;
         } else {

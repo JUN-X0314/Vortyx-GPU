@@ -1,15 +1,17 @@
 #pragma once
 
 // Internal header: shared PCI vendor-id to vendor-name mapping.
-// Contains only well-known PCI vendor IDs; unknown IDs are reported as
-// an empty string so callers can display "unknown" instead of a guess.
+// Contains only well-known PCI vendor IDs (plus software-implementation
+// pseudo-IDs such as Mesa's 0x10005, which does not fit in 16 bits);
+// unknown IDs are reported as an empty string so callers can display
+// "unknown" instead of a guess.
 
 #include <cstdint>
 #include <string>
 
 namespace vortyx::device::detail {
 
-inline std::string pci_vendor_name(std::uint16_t vendor_id) {
+inline std::string pci_vendor_name(std::uint32_t vendor_id) {
     switch (vendor_id) {
         case 0x10DE: return "NVIDIA";
         case 0x1002: return "AMD";
@@ -23,6 +25,7 @@ inline std::string pci_vendor_name(std::uint16_t vendor_id) {
         case 0x1B36: return "QEMU";
         case 0x1013: return "Cirrus Logic";
         case 0x1234: return "Bochs/QEMU (VGA)";
+        case 0x10005: return "Mesa";  // software implementations (lavapipe/llvmpipe)
         default: return "";
     }
 }

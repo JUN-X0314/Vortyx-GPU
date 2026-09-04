@@ -12,6 +12,10 @@ enum class DeviceType {
     Unknown,
     Cpu,
     Gpu,
+    // Software implementation of a GPU API running on the CPU
+    // (e.g. a CPU-type Vulkan physical device such as lavapipe).
+    // Reported honestly instead of being labeled a real GPU.
+    SoftwareGpu,
 };
 
 // Representation of a single computing device found on the system.
