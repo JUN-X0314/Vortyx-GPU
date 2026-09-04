@@ -36,7 +36,19 @@ jobs:
         run: choco install vulkan-sdk -y --no-progress
 
       - name: Configure (CMake)
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          # On Windows the chocolatey SDK install may not export VULKAN_SDK
+          # into this session; detect the SDK directory and export it so
+          # find_package(Vulkan) succeeds and the GPU backend compiles.
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            SDK_DIR=$(ls -d /c/VulkanSDK/*/ 2>/dev/null | head -1 || true)
+            if [ -n "$SDK_DIR" ]; then
+              export VULKAN_SDK="$(cygpath -w "${SDK_DIR%/}")"
+              echo "VULKAN_SDK=$VULKAN_SDK"
+            fi
+          fi
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release
