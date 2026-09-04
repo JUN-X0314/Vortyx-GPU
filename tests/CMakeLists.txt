@@ -37,3 +37,18 @@ add_test(NAME ResourceTest COMMAND test_resource)
 add_executable(test_resource_gpu test_resource_gpu.cpp)
 target_link_libraries(test_resource_gpu PRIVATE vortyx_core)
 add_test(NAME ResourceGpuTest COMMAND test_resource_gpu)
+
+# Phase 5: Virtual GPU Interface.
+# - CPU Virtual GPU tests must pass on every system (including GPU-less
+#   machines and CPU-only builds): lifecycle, state errors, move semantics,
+#   honest backend-unavailability reporting.
+# - Vulkan Virtual GPU tests run for real when a Vulkan device is available;
+#   on systems without one they exit with an explicit SKIP note (never a
+#   fake success).
+add_executable(test_vgpu test_vgpu.cpp)
+target_link_libraries(test_vgpu PRIVATE vortyx_core)
+add_test(NAME VirtualGpuTest COMMAND test_vgpu)
+
+add_executable(test_vgpu_gpu test_vgpu_gpu.cpp)
+target_link_libraries(test_vgpu_gpu PRIVATE vortyx_core)
+add_test(NAME VirtualGpuGpuTest COMMAND test_vgpu_gpu)

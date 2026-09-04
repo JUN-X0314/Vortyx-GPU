@@ -166,9 +166,9 @@ bool VulkanBackend::initialize() {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "Vortyx";
-        app.applicationVersion = VK_MAKE_VERSION(0, 4, 0);
+        app.applicationVersion = VK_MAKE_VERSION(0, 5, 0);
         app.pEngineName = "VortyxRuntime";
-        app.engineVersion = VK_MAKE_VERSION(0, 4, 0);
+        app.engineVersion = VK_MAKE_VERSION(0, 5, 0);
         app.apiVersion = VK_API_VERSION_1_0;
 
         VkInstanceCreateInfo instance_info{};

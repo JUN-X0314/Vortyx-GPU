@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.4.0
+    VERSION 0.5.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -63,6 +63,9 @@ add_library(vortyx_core STATIC
     src/core/resource/resource_manager.cpp
     src/core/resource/cpu_buffer.cpp
     src/core/resource/vulkan_buffer.cpp
+
+    # Virtual GPU Interface (Phase 5)
+    src/core/vgpu/virtual_gpu.cpp
 )
 target_include_directories(vortyx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 

@@ -6,10 +6,10 @@
 #include "core/device/discovery.hpp"
 #include "core/device/device.hpp"
 #include "core/compute/task.hpp"
-#include "core/compute/runtime.hpp"
 #include "core/resource/buffer.hpp"
 #include "core/resource/resource.hpp"
 #include "core/resource/resource_manager.hpp"
+#include "core/vgpu/virtual_gpu.hpp"
 
 #ifndef VORTYX_BUILD_CONFIG
 #define VORTYX_BUILD_CONFIG "Unknown"
@@ -28,16 +28,16 @@ std::string join_values(const std::vector<std::int32_t>& values, std::size_t max
     return out;
 }
 
-// Phase 4: runs one vector addition entirely through explicit Buffer
-// resources, demonstrating the full resource lifecycle:
+// Phase 5: runs one vector addition entirely through the Virtual GPU API,
+// using explicit Buffer resources underneath:
 //   create -> write (upload) -> execute -> read (download) -> release.
 // Returns false and fills 'error' on any failure. Buffers are released
 // explicitly with reset() at the end (RAII would release them at scope exit
 // even on the error paths above).
-bool run_resource_vector_add(vortyx::compute::Runtime& runtime, const std::string& backend_name,
-                             const std::vector<std::int32_t>& input_a,
-                             const std::vector<std::int32_t>& input_b,
-                             std::vector<std::int32_t>& output, std::string& error) {
+bool run_vgpu_resource_vector_add(vortyx::vgpu::VirtualGpu& gpu,
+                                  const std::vector<std::int32_t>& input_a,
+                                  const std::vector<std::int32_t>& input_b,
+                                  std::vector<std::int32_t>& output, std::string& error) {
     const std::size_t count = input_a.size();
     const std::size_t bytes = count * sizeof(std::int32_t);
 
@@ -46,18 +46,24 @@ bool run_resource_vector_add(vortyx::compute::Runtime& runtime, const std::strin
     const vortyx::resource::BufferDesc desc_out =
         vortyx::resource::BufferDesc::of<std::int32_t>(count, vortyx::resource::ResourceAccess::Write);
 
-    // 1. Resource creation through the Runtime's Resource Manager.
-    vortyx::resource::BufferResult ra = runtime.resources().create_buffer(desc_in, backend_name);
+    // 1. Resource creation through the Virtual GPU's Resource Manager, on the
+    //    backend this Virtual GPU was explicitly configured for.
+    vortyx::resource::ResourceManager* manager = gpu.resources();
+    if (manager == nullptr) {
+        error = "Virtual GPU has no Resource Manager (not initialized)";
+        return false;
+    }
+    vortyx::resource::BufferResult ra = manager->create_buffer(desc_in, gpu.backend_name());
     if (ra.status != vortyx::compute::Status::Ok) {
         error = "buffer A: " + ra.error;
         return false;
     }
-    vortyx::resource::BufferResult rb = runtime.resources().create_buffer(desc_in, backend_name);
+    vortyx::resource::BufferResult rb = manager->create_buffer(desc_in, gpu.backend_name());
     if (rb.status != vortyx::compute::Status::Ok) {
         error = "buffer B: " + rb.error;
         return false;
     }
-    vortyx::resource::BufferResult rc = runtime.resources().create_buffer(desc_out, backend_name);
+    vortyx::resource::BufferResult rc = manager->create_buffer(desc_out, gpu.backend_name());
     if (rc.status != vortyx::compute::Status::Ok) {
         error = "buffer C: " + rc.error;
         return false;
@@ -77,8 +83,9 @@ bool run_resource_vector_add(vortyx::compute::Runtime& runtime, const std::strin
             break;
         }
 
-        // 3. Compute: the backend reads/writes the resources directly.
-        const vortyx::compute::ComputeResult exec = runtime.execute(ra.buffer, rb.buffer, rc.buffer);
+        // 3. Compute through the Virtual GPU: the backend reads/writes the
+        //    resources directly.
+        const vortyx::compute::ComputeResult exec = gpu.execute(ra.buffer, rb.buffer, rc.buffer);
         if (exec.status != vortyx::compute::Status::Ok) {
             error = "execute: " + exec.error;
             break;
@@ -103,13 +110,22 @@ bool run_resource_vector_add(vortyx::compute::Runtime& runtime, const std::strin
     return ok;
 }
 
+// Honest one-line description of the device a Virtual GPU executes on.
+std::string vgpu_device_text(const vortyx::vgpu::VirtualGpu& gpu) {
+    const vortyx::device::DeviceInfo device = gpu.device_info();
+    if (device.type == vortyx::device::DeviceType::Unknown) {
+        return "no device reported";
+    }
+    return vortyx::device::describe(device);
+}
+
 }  // namespace
 
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   4 (Compute Resource & Memory Management)" << std::endl;
+    std::cout << "  Phase:   5 (Virtual GPU Interface)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -146,104 +162,161 @@ int main() {
                         ")");
     }
 
-    // Compute Runtime (Phase 3) + Resource Manager (Phase 4).
-    vortyx::compute::Runtime runtime;
-    if (runtime.initialize() != vortyx::compute::Status::Ok) {
-        vortyx::log(vortyx::LogLevel::Error, "Compute Runtime failed to initialize.");
-        return 1;
-    }
-
     const std::vector<std::int32_t> demo_a = {1, 2, 3, 4, 5, 6, 7, 8};
     const std::vector<std::int32_t> demo_b = {10, 20, 30, 40, 50, 60, 70, 80};
 
-    // --- 1. Task-based execution (Phase 3 API, now routed through the
-    //        Resource Manager internally) -----------------------------------
-    vortyx::compute::VectorAddTask demo;
-    demo.a = demo_a;
-    demo.b = demo_b;
+    std::vector<std::int32_t> cpu_task_result;
+    std::vector<std::int32_t> cpu_resource_result;
 
-    const vortyx::compute::VectorAddResult cpu_result = runtime.execute(demo, "cpu");
-    if (cpu_result.status == vortyx::compute::Status::Ok) {
-        vortyx::log(vortyx::LogLevel::Info,
-                    "CPU execution success: C = A + B (" + join_values(cpu_result.data, 8) + ")");
-    } else {
-        vortyx::log(vortyx::LogLevel::Error,
-                    std::string("CPU execution failed: ") + to_string(cpu_result.status) +
-                        " - " + cpu_result.error);
-    }
-
-    if (runtime.has_backend("vulkan")) {
-        const vortyx::compute::VectorAddResult gpu_result = runtime.execute(demo, "vulkan");
-        if (gpu_result.status == vortyx::compute::Status::Ok) {
-            const bool match = (gpu_result.data == cpu_result.data);
-            const vortyx::device::DeviceInfo gpu_device = runtime.backend_device("vulkan");
-            vortyx::log(vortyx::LogLevel::Info,
-                        "GPU (Vulkan) execution success on '" +
-                            (gpu_device.name.empty() ? std::string("unknown device")
-                                                     : gpu_device.name) +
-                            "': C = A + B (" + join_values(gpu_result.data, 8) + ")");
-            vortyx::log(vortyx::LogLevel::Info,
-                        match ? "Result verification: GPU output matches CPU reference."
-                              : "Result verification: MISMATCH between GPU and CPU results!");
-        } else {
-            vortyx::log(vortyx::LogLevel::Warning,
-                        std::string("GPU (Vulkan) execution failed: ") +
-                            to_string(gpu_result.status) + " - " + gpu_result.error);
+    // =====================================================================
+    // 1. CPU Virtual GPU (Phase 5): the always-available logical device.
+    // =====================================================================
+    {
+        vortyx::vgpu::VirtualGpuDesc desc;  // backend defaults to "cpu"
+        vortyx::vgpu::VirtualGpu gpu;
+        if (gpu.initialize(desc) != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error, "CPU Virtual GPU failed to initialize.");
+            return 1;
         }
-    } else {
         vortyx::log(vortyx::LogLevel::Info,
-                    "GPU (Vulkan) backend unavailable on this system: " +
-                        runtime.backend_unavailable_reason("vulkan"));
-    }
+                    "CPU Virtual GPU ready: backend='" + gpu.backend_name() + "', state=" +
+                        vortyx::vgpu::to_string(gpu.state()) + ", device: " +
+                        vgpu_device_text(gpu));
 
-    // --- 2. Resource-based execution (Phase 4 API): the same calculation
-    //        with explicitly managed Buffer resources ------------------------
-    std::vector<std::int32_t> resource_cpu;
-    std::string resource_error;
-    if (run_resource_vector_add(runtime, "cpu", demo_a, demo_b, resource_cpu, resource_error)) {
-        vortyx::log(vortyx::LogLevel::Info,
-                    "Resource-based CPU execution success: C = A + B (" +
-                        join_values(resource_cpu, 8) + ")");
-    } else {
-        vortyx::log(vortyx::LogLevel::Error,
-                    "Resource-based CPU execution failed: " + resource_error);
-    }
+        // --- 1a. Task-based execution through the Virtual GPU ------------
+        vortyx::compute::VectorAddTask demo;
+        demo.a = demo_a;
+        demo.b = demo_b;
 
-    if (runtime.has_backend("vulkan")) {
-        std::vector<std::int32_t> resource_gpu;
-        if (run_resource_vector_add(runtime, "vulkan", demo_a, demo_b, resource_gpu,
-                                    resource_error)) {
-            const vortyx::device::DeviceInfo gpu_device = runtime.backend_device("vulkan");
+        const vortyx::compute::VectorAddResult result = gpu.execute(demo);
+        if (result.status == vortyx::compute::Status::Ok) {
+            cpu_task_result = result.data;
             vortyx::log(vortyx::LogLevel::Info,
-                        "Resource-based GPU (Vulkan) execution success on '" +
-                            (gpu_device.name.empty() ? std::string("unknown device")
-                                                     : gpu_device.name) +
-                            "': C = A + B (" + join_values(resource_gpu, 8) + ")");
-            const bool match = (resource_gpu == resource_cpu) && (resource_gpu == cpu_result.data);
-            vortyx::log(vortyx::LogLevel::Info,
-                        match ? "Resource verification: GPU buffer output matches CPU output."
-                              : "Resource verification: MISMATCH between GPU and CPU buffer outputs!");
+                        "Virtual GPU (cpu) task execution success: C = A + B (" +
+                            join_values(result.data, 8) + ")");
         } else {
-            vortyx::log(vortyx::LogLevel::Warning,
-                        "Resource-based GPU (Vulkan) execution failed: " + resource_error);
+            vortyx::log(vortyx::LogLevel::Error,
+                        std::string("Virtual GPU (cpu) task execution failed: ") +
+                            to_string(result.status) + " - " + result.error);
         }
+
+        // --- 1b. Resource-based execution through the Virtual GPU --------
+        std::string resource_error;
+        if (run_vgpu_resource_vector_add(gpu, demo_a, demo_b, cpu_resource_result,
+                                         resource_error)) {
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Virtual GPU (cpu) resource execution success: C = A + B (" +
+                            join_values(cpu_resource_result, 8) + ")");
+        } else {
+            vortyx::log(vortyx::LogLevel::Error,
+                        "Virtual GPU (cpu) resource execution failed: " + resource_error);
+        }
+
+        // --- 1c. Honest resource accounting ------------------------------
+        const vortyx::resource::ResourceStats stats = gpu.resources()->stats();
+        vortyx::log(vortyx::LogLevel::Info,
+                    "CPU Virtual GPU resource stats: " + std::to_string(stats.live_buffers) +
+                        " live buffer(s), " + std::to_string(stats.live_bytes) +
+                        " live byte(s), " + std::to_string(stats.total_allocations) +
+                        " total allocation(s).");
+
+        gpu.shutdown();
     }
 
-    // Honest accounting: after the demos everything was released through
-    // RAII / reset(); the manager reports zero live buffers.
-    const vortyx::resource::ResourceStats stats = runtime.resources().stats();
-    vortyx::log(vortyx::LogLevel::Info,
-                "Resource stats: " + std::to_string(stats.live_buffers) +
-                    " live buffer(s), " + std::to_string(stats.live_bytes) +
-                    " live byte(s), " + std::to_string(stats.total_allocations) +
-                    " total allocation(s) this session.");
+    // =====================================================================
+    // 2. Vulkan Virtual GPU (Phase 5): created always, reported honestly.
+    //    A known-but-unavailable backend is a normal environment state, so
+    //    initialization succeeds; the truth is in backend_available().
+    //    There is NO automatic fallback: the CPU path above was already an
+    //    explicit CPU Virtual GPU.
+    // =====================================================================
+    {
+        vortyx::vgpu::VirtualGpuDesc desc;
+        desc.backend = "vulkan";
+        vortyx::vgpu::VirtualGpu gpu;
+        if (gpu.initialize(desc) != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error,
+                        "Vulkan Virtual GPU initialization returned an unexpected failure.");
+            return 1;
+        }
 
-    runtime.shutdown();
+        if (gpu.backend_available()) {
+            const vortyx::device::DeviceInfo device = gpu.device_info();
+            const bool software = (device.type == vortyx::device::DeviceType::SoftwareGpu);
+            vortyx::log(vortyx::LogLevel::Info,
+                        std::string("Vulkan Virtual GPU ready: backend='vulkan', device: ") +
+                            (device.name.empty() ? std::string("unknown") : device.name) +
+                            (software ? " (software/CPU implementation - not a hardware GPU)"
+                                      : ""));
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Device details: " + vgpu_device_text(gpu));
+
+            // --- 2a. Task-based execution -------------------------------
+            vortyx::compute::VectorAddTask demo;
+            demo.a = demo_a;
+            demo.b = demo_b;
+
+            const vortyx::compute::VectorAddResult result = gpu.execute(demo);
+            if (result.status == vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Virtual GPU (vulkan) task execution success: C = A + B (" +
+                                join_values(result.data, 8) + ")");
+                const bool match = (result.data == cpu_task_result);
+                vortyx::log(vortyx::LogLevel::Info,
+                            match ? "Result verification: Virtual GPU (vulkan) output matches "
+                                    "Virtual GPU (cpu) output."
+                                  : "Result verification: MISMATCH between vulkan and cpu "
+                                    "Virtual GPU outputs!");
+            } else {
+                vortyx::log(vortyx::LogLevel::Warning,
+                            std::string("Virtual GPU (vulkan) task execution failed: ") +
+                                to_string(result.status) + " - " + result.error);
+            }
+
+            // --- 2b. Resource-based execution ---------------------------
+            std::vector<std::int32_t> vulkan_resource_result;
+            std::string resource_error;
+            if (run_vgpu_resource_vector_add(gpu, demo_a, demo_b, vulkan_resource_result,
+                                             resource_error)) {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Virtual GPU (vulkan) resource execution success: C = A + B (" +
+                                join_values(vulkan_resource_result, 8) + ")");
+                const bool match = (vulkan_resource_result == cpu_resource_result);
+                vortyx::log(vortyx::LogLevel::Info,
+                            match ? "Resource verification: vulkan buffer output matches cpu "
+                                    "buffer output."
+                                  : "Resource verification: MISMATCH between vulkan and cpu "
+                                    "buffer outputs!");
+            } else {
+                vortyx::log(vortyx::LogLevel::Warning,
+                            "Virtual GPU (vulkan) resource execution failed: " + resource_error);
+            }
+        } else {
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Vulkan Virtual GPU is not usable on this system: " +
+                            gpu.backend_unavailable_reason());
+            vortyx::log(vortyx::LogLevel::Info,
+                        "No fallback was attempted: the CPU Virtual GPU above ran on the "
+                        "explicitly configured cpu backend.");
+        }
+
+        gpu.shutdown();
+
+        // --- 2c. Honest error behavior after shutdown (no crash) ---------
+        vortyx::compute::VectorAddTask demo;
+        demo.a = demo_a;
+        demo.b = demo_b;
+        const vortyx::compute::VectorAddResult refused = gpu.execute(demo);
+        vortyx::log(vortyx::LogLevel::Info,
+                    std::string("Post-shutdown execute() refused as expected: ") +
+                        to_string(refused.status) + " - " + refused.error);
+    }
 
     vortyx::log(vortyx::LogLevel::Info, "Hardware discovery: implemented (Phase 2).");
     vortyx::log(vortyx::LogLevel::Info, "Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Virtual GPU (Phase 5), Task Queue (Phase 6), Scheduler (Phase 7), Multi-GPU, Distributed Computing.");
+    vortyx::log(vortyx::LogLevel::Info, "Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Task Queue (Phase 6), Scheduler (Phase 7), Multi-GPU, Distributed Computing.");
 
     return 0;
 }
