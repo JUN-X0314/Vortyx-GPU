@@ -11,6 +11,7 @@
 #include "core/resource/resource_manager.hpp"
 #include "core/vgpu/virtual_gpu.hpp"
 #include "core/queue/task_queue.hpp"
+#include "core/scheduler/scheduler.hpp"
 
 #ifndef VORTYX_BUILD_CONFIG
 #define VORTYX_BUILD_CONFIG "Unknown"
@@ -126,7 +127,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   6 (Task Queue & Async Execution)" << std::endl;
+    std::cout << "  Phase:   7 (Basic Scheduler)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -391,12 +392,134 @@ int main() {
         gpu.shutdown();
     }
 
+    // =====================================================================
+    // 4. Basic Scheduler (Phase 7): decide WHERE to execute. The Scheduler
+    //    only SELECTS the execution target (deterministic, explainable,
+    //    based on real backend availability); the actual computation keeps
+    //    flowing through the unchanged Virtual GPU path. An explicit request
+    //    is never silently remapped; the automatic policy picks the first
+    //    AVAILABLE backend in the documented order (vulkan > cpu).
+    // =====================================================================
+    {
+        vortyx::scheduler::Scheduler scheduler;
+        if (scheduler.initialize() != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error, "Scheduler failed to initialize.");
+            return 1;
+        }
+
+        // --- 4a. Automatic selection: what CAN this system run on? -------
+        vortyx::scheduler::SelectionResult selection = scheduler.select(vortyx::scheduler::SelectionRequest{});
+        if (selection.status != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error,
+                        "Automatic selection failed: " + selection.error);
+            return 1;
+        }
+        vortyx::log(vortyx::LogLevel::Info,
+                    "Automatic selection: backend='" + selection.backend + "', device: " +
+                        (selection.device.name.empty() ? std::string("unknown")
+                                                       : selection.device.name));
+        vortyx::log(vortyx::LogLevel::Info, "Selection reason: " + selection.reason);
+
+        std::vector<std::int32_t> auto_selected_result;
+
+        // --- 4b. Execute through the SELECTED target (unchanged path) ----
+        {
+            vortyx::vgpu::VirtualGpuDesc desc;
+            desc.backend = selection.backend;  // the Scheduler's choice, verbatim
+            vortyx::vgpu::VirtualGpu gpu;
+            if (gpu.initialize(desc) != vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Error, "Virtual GPU from selection failed to initialize.");
+                return 1;
+            }
+
+            vortyx::compute::VectorAddTask demo;
+            demo.a = demo_a;
+            demo.b = demo_b;
+            const vortyx::compute::VectorAddResult result = gpu.execute(demo);
+            if (result.status == vortyx::compute::Status::Ok) {
+                auto_selected_result = result.data;
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Execution on the selected backend ('" + gpu.backend_name() +
+                                "'): C = A + B (" + join_values(result.data, 8) + ")");
+            } else {
+                vortyx::log(vortyx::LogLevel::Error,
+                            std::string("Execution on the selected backend failed: ") +
+                                to_string(result.status) + " - " + result.error);
+            }
+            gpu.shutdown();
+        }
+
+        // --- 4c. Explicit 'cpu' request: honored verbatim, never remapped.
+        {
+            vortyx::scheduler::SelectionRequest cpu_request;
+            cpu_request.mode = vortyx::scheduler::SelectionMode::ExplicitBackend;
+            cpu_request.backend = "cpu";
+            const vortyx::scheduler::SelectionResult cpu_selection = scheduler.select(cpu_request);
+            if (cpu_selection.status == vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Explicit selection: backend='" + cpu_selection.backend +
+                                "' (" + cpu_selection.reason + ")");
+
+                vortyx::vgpu::VirtualGpuDesc desc;
+                desc.backend = cpu_selection.backend;
+                vortyx::vgpu::VirtualGpu gpu;
+                gpu.initialize(desc);
+
+                vortyx::compute::VectorAddTask demo;
+                demo.a = demo_a;
+                demo.b = demo_b;
+                const vortyx::compute::VectorAddResult result = gpu.execute(demo);
+                if (result.status == vortyx::compute::Status::Ok) {
+                    const bool match = (result.data == auto_selected_result);
+                    vortyx::log(vortyx::LogLevel::Info,
+                                match ? "Verification: explicit-cpu execution matches the "
+                                        "automatically selected backend's output."
+                                      : "Verification: MISMATCH between explicit-cpu and "
+                                        "automatically selected backend outputs!");
+                } else {
+                    vortyx::log(vortyx::LogLevel::Error,
+                                std::string("Explicit-cpu execution failed: ") +
+                                    to_string(result.status) + " - " + result.error);
+                }
+                gpu.shutdown();
+            } else {
+                vortyx::log(vortyx::LogLevel::Error,
+                            "Explicit 'cpu' selection failed unexpectedly: " + cpu_selection.error);
+            }
+        }
+
+        // --- 4d. Explicit 'vulkan' request: honored or honestly refused --
+        //         (never silently rerouted to the cpu backend).
+        {
+            vortyx::scheduler::SelectionRequest vk_request;
+            vk_request.mode = vortyx::scheduler::SelectionMode::ExplicitBackend;
+            vk_request.backend = "vulkan";
+            const vortyx::scheduler::SelectionResult vk_selection = scheduler.select(vk_request);
+            if (vk_selection.status == vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Explicit selection: backend='vulkan', device: " +
+                                (vk_selection.device.name.empty() ? std::string("unknown")
+                                                                  : vk_selection.device.name));
+            } else {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Explicit 'vulkan' selection refused as expected on this system: " +
+                                vk_selection.error);
+                vortyx::log(vortyx::LogLevel::Info,
+                            "No fallback was attempted: an explicit request is never rerouted "
+                                "to another backend.");
+            }
+        }
+
+        scheduler.shutdown();  // shares nothing with the Virtual GPUs above
+    }
+
     vortyx::log(vortyx::LogLevel::Info, "Hardware discovery: implemented (Phase 2).");
     vortyx::log(vortyx::LogLevel::Info, "Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.");
     vortyx::log(vortyx::LogLevel::Info, "Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.");
     vortyx::log(vortyx::LogLevel::Info, "Task Queue: implemented (Phase 6) - FIFO task submission, one worker thread, asynchronous execution, per-task id/state/result, drain-on-shutdown.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Scheduler (Phase 7), Multi-GPU, Distributed Computing.");
+    vortyx::log(vortyx::LogLevel::Info, "Basic Scheduler: implemented (Phase 7) - deterministic execution-target selection (explicit request or automatic vulkan>cpu policy) from real backend availability; selection only, execution stays in the Virtual GPU path.");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing.");
 
     return 0;
 }

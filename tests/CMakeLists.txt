@@ -67,3 +67,19 @@ add_test(NAME TaskQueueTest COMMAND test_taskqueue)
 add_executable(test_taskqueue_gpu test_taskqueue_gpu.cpp)
 target_link_libraries(test_taskqueue_gpu PRIVATE vortyx_core)
 add_test(NAME TaskQueueGpuTest COMMAND test_taskqueue_gpu)
+
+# Phase 7: Basic Scheduler.
+# - CPU scheduler tests must pass on every system (including GPU-less
+#   machines and CPU-only builds): lifecycle, request validation, the pure
+#   selection policy over synthetic candidates, adaptive real selections,
+#   determinism, shutdown/re-init, TaskQueue integration, concurrency.
+# - GPU scheduler tests run for real when a Vulkan device is available (the
+#   automatic policy must pick 'vulkan' there); on systems without one they
+#   exit with an explicit SKIP note (never a fake success).
+add_executable(test_scheduler test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE vortyx_core)
+add_test(NAME SchedulerTest COMMAND test_scheduler)
+
+add_executable(test_scheduler_gpu test_scheduler_gpu.cpp)
+target_link_libraries(test_scheduler_gpu PRIVATE vortyx_core)
+add_test(NAME SchedulerGpuTest COMMAND test_scheduler_gpu)
