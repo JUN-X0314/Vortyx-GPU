@@ -6,9 +6,17 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 12 (v0.12.0) — Distributed / Multi-GPU Device System
+## Current Phase: Phase 13 (v0.13.0) — AI/ML Acceleration + Tensor Layer
 
-Phase 12 builds the **Distributed / Multi-GPU Device System**: several logical Vortyx devices are managed as one compute cluster through a new provider-neutral, transport-neutral layer (`vortyx::distributed`, `src/distributed/`) layered ON TOP of the unchanged Phase 11 platform and the unchanged compute core. A device registry with atomic resource leases holds the cluster; deterministic scheduling policies (`round_robin` / `least_loaded` / `capability_fit`) place the shards of one logical job onto capable devices from immutable cluster snapshots; workers execute shards **through the unchanged local compute path** (one exclusive Runtime per device); failures are classified by a stable code vocabulary and retried under a bounded, explicit policy that never re-runs succeeded shards; and shard results are reassembled into one deterministic logical result with duplicate-safe aggregation. The local multi-device simulator and the `vortyx_cluster` diagnostic tool prove the whole flow end to end without any GPU hardware or network.
+Phase 13 adds the **Tensor Layer** — `vortyx::tensor` (`src/tensor/`), a new static library layered ON TOP of the unchanged Phase 12 distributed system — giving Vortyx a real abstraction for AI/ML tensor work: N-dimensional tensors with checked shape/stride/broadcast arithmetic and five explicit dtypes (`fp32`, `fp16`, `bf16`, `int32`, `int8`); device placement expressed on the EXISTING Phase 11/12 identity system; tensor storage allocated EXCLUSIVELY through the Phase 4 resource system (one memory world, honest accounting, the 1 GiB per-buffer cap); a validated operation surface (`matmul`, `gemm`, `add`/`subtract`/`multiply`/`divide` with NumPy-style broadcasting, `reduce_sum`, `reduce_mean`, `relu`, `sigmoid`, `tanh`, `softmax` with max-subtraction, `transpose`, `reshape`) driven by ONE rule set (`validate_op`) shared by execution and planning; deterministic CPU reference kernels (fp16/bf16 run the documented promote-compute-round semantics, fp32 accumulation with pinned k-ascending order); a runtime adapter that routes int32 elementwise tensor ops into the REAL Phase 3–10 engine (real CPU — and real Vulkan GPU where a device exists); `TensorGraph` with deterministic node ids, cycle detection and full shape/dtype inference; a deterministic execution planner (validation → capability check → smallest-id-first topological order → liveness-safe memory-slot reuse with exact-size first-fit); capability-based backend dispatch (the first backend whose REAL capability table satisfies the request — unknown capability is never guessed into support); and capability-based tensor placement over Phase 12 cluster snapshots read-only (reusing the ownership filter, resource accounting and rejection-code style — no Phase 12 code modified).
+
+**Honest scope (stated, not buried)**: there are NO hardware tensor kernels in this repository — nothing claims Tensor Core/CUDA/ROCm, and `matrix_acceleration` is `not_claimed` everywhere by construction. FP64, autograd/training, quantized kernels, model file formats (ONNX/PyTorch/SafeTensors), cross-device tensor transfer and distributed graph partitioning do not exist in Phase 13; each absence is a documented non-goal with an extension point, never a TODO disguised as done. Phase 13's completion criterion is exactly this: **Vortyx can express, validate, plan and dispatch AI/ML tensor workloads according to backend capability — in real code, verified by real tests.**
+
+---
+
+## Phase 12 — Distributed / Multi-GPU Device System (v0.12.0, kept in force)
+
+Phase 12 built the **Distributed / Multi-GPU Device System**: several logical Vortyx devices are managed as one compute cluster through a provider-neutral, transport-neutral layer (`vortyx::distributed`, `src/distributed/`) layered ON TOP of the unchanged Phase 11 platform and the unchanged compute core. A device registry with atomic resource leases holds the cluster; deterministic scheduling policies (`round_robin` / `least_loaded` / `capability_fit`) place the shards of one logical job onto capable devices from immutable cluster snapshots; workers execute shards **through the unchanged local compute path** (one exclusive Runtime per device); failures are classified by a stable code vocabulary and retried under a bounded, explicit policy that never re-runs succeeded shards; and shard results are reassembled into one deterministic logical result with duplicate-safe aggregation. The local multi-device simulator and the `vortyx_cluster` diagnostic tool prove the whole flow end to end without any GPU hardware or network.
 
 - **Additive by construction**: `vortyx_distributed → vortyx_platform → vortyx_core` in the build graph; the core never sees any upper layer. `VORTYX_ENABLE_DISTRIBUTED=OFF` — or `VORTYX_ENABLE_PLATFORM=OFF`, which disables it automatically — reproduces the previous build exactly, and no existing API, test or behavior changed.
 - **Reuse over redefinition**: device identity/ownership/metadata are the Phase 11 `DeviceId/UserId/DeviceMetadata`; the submission contract is the Phase 11 `JobEnvelope`; the optional platform integration speaks only `IPlatformStore` with the submitter's own `AuthContext`. One vocabulary everywhere; `ComputeTask` still stays local and never travels the control plane.
@@ -37,6 +45,15 @@ Distributed (Phase 12) ── one cluster of logical devices, orchestrated end t
                             → Workers (LocalWorker → the unchanged Runtime, one per device) → Aggregation
                Transport: IWorkerTransport (in-process loopback only — no network in Phase 12)
                (the compute path still knows NOTHING about any of this)
+
+Tensor (Phase 13) ── AI/ML tensor workloads, expressed and dispatched by capability
+            └─ Tensor (shape · dtype · layout · placement · storage via the Phase 4 resource system)
+               → TensorOps (one rule set: validate_op drives execution AND planning)
+               → ITensorBackend (CpuReferenceTensorBackend | RuntimeElementwiseTensorBackend
+                                 → the REAL Phase 3–10 engine → CPU / Vulkan GPU)
+               → TensorGraph → deterministic Planner (capability check · topo order · memory slots)
+               → Placement over Phase 12 cluster snapshots (read-only; ownership + resources reused)
+               (the distributed/platform/core layers know NOTHING about this layer)
 ```
 
 ## Phase 10 — Compute Engine (v0.10.0, kept in force)
@@ -327,8 +344,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.12.0
-  Phase:   12 (Distributed / Multi-GPU Device System)
+  Version: 0.13.0
+  Phase:   13 (AI/ML Acceleration + Tensor Layer)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -471,7 +488,7 @@ On a machine without any Vulkan device (or in a CPU-only build), the program ins
 ```
 Vortyx-GPU/
 ├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible, platform-api + no-platform + clang jobs)
-├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN / _PLATFORM / _DISTRIBUTED options)
+├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN / _PLATFORM / _DISTRIBUTED / _TENSOR options)
 ├── shaders/
 │   ├── vector_add.comp             # Vector addition compute kernel (GLSL source)
 │   ├── vector_multiply.comp        # Phase 10 elementwise multiply kernel
@@ -550,6 +567,24 @@ Vortyx-GPU/
 │                                   #   local development / deployment checklist
 ├── docs/distributed/               # Phase 12: architecture / device-model / scheduling /
 │                                   #   failure-handling / api / local-development
+├── docs/tensor/                    # Phase 13: architecture / operations / planning /
+│                                   #   distributed-integration / local development
+├── src/tensor/                     # Phase 13: the tensor layer (vortyx::tensor)
+│   ├── status.*                    # TensorStatus + stable snake_case codes + compute mapping
+│   ├── dtype.*                     # DataType: fp32/fp16/bf16/int32/int8 (closed, named)
+│   ├── shape.*                     # N-D shapes, strides, layouts, broadcasting (checked math)
+│   ├── placement.*                 # Device placement (Phase 11 identity reuse, honest transfers)
+│   ├── storage.*                   # TensorStorage — allocation ONLY via Phase 4 resources
+│   ├── tensor_value.*              # The Tensor value type + read-only views
+│   ├── op.*                        # The op vocabulary + THE one rule set (validate_op)
+│   ├── capability.*                # TensorCapabilities / requirements (honest self-report)
+│   ├── backend.*                   # Reference kernels + runtime adapter + dispatch
+│   ├── executor.*                  # Single-op execution facade (validate→dispatch→run)
+│   ├── graph.*                     # TensorGraph: ids, binding, validation, cycles, topo
+│   ├── plan.*                      # Deterministic planner + liveness-safe memory planner
+│   ├── graph_executor.*            # Planned graph execution with per-step traces
+│   ├── placement_integration.*     # Phase 12 snapshot → capability-based placement
+│   └── serialize.*                 # Metadata-only JSON (strict Phase 11 module; no payload)
 └── tests/
     ├── test_platform.cpp           # Phase 11 platform models + store + authz: must pass everywhere
     ├── test_platform_contract.cpp  # Phase 11 wire contract (JSON, errors, parsers, serializers)
@@ -559,6 +594,11 @@ Vortyx-GPU/
     ├── test_distributed_worker.cpp         # Phase 12 worker slicing bit-exactness + transport + simulator
     ├── test_distributed_orchestrator.cpp   # Phase 12 acceptance scenarios A~J end to end
     ├── test_distributed_contract.cpp       # Phase 12 distributed wire contract (C++ side)
+    ├── test_tensor_core.cpp                # Phase 13 dtype/shape/layout/broadcast/storage/views/serialization
+    ├── test_tensor_ops.cpp                 # Phase 13 op surface vs hand-verified values + FP32 baselines
+    ├── test_tensor_graph.cpp               # Phase 13 graph validation/plan determinism/memory reuse/e2e
+    ├── test_tensor_dispatch.cpp            # Phase 13 capability dispatch + runtime adapter + error codes
+    ├── test_tensor_distributed.cpp         # Phase 13 placement over Phase 12 snapshots + transfer honesty
     ├── test_compute_tasks.cpp     # Phase 10 Compute Engine CPU path: must pass everywhere
     ├── test_compute_tasks_gpu.cpp # Phase 10 Compute Engine GPU path: real tests when Vulkan available
     ├── ... (Phase 1~9 tests unchanged)
@@ -572,7 +612,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.12.0 |
+| VersionTest | Version constants match 0.13.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -599,6 +639,11 @@ ctest --test-dir build -C Release --output-on-failure
 | DistributedWorkerTest | Worker/transport/simulator (every system, CPU backend): the LocalWorker lifecycle (Starting/Ready/Running/Draining/Stopped, refusal with real reasons before start/while draining/after stop, idempotent start), **slicing bit-exactness — slice → execute → reassemble equals the full-range execution for all three ops at a non-multiple size**, assignment validation (wrong device, empty range, out-of-domain range, unclaimed operation, unknown explicit backend refused without fallback, available explicit backend honored, identity carried on results), the loopback transport (dispatch, device-less ghost = device_lost, worker_for resolution, one worker per device, deterministic failure injection that fires BEFORE the worker and decrements visibly, cancel recording), and the local multi-device simulator (honest backend claims from a real Runtime probe — cpu always, canonical names only, activation to Ready+Healthy, conflicting re-registration refused, identical re-registration replayed, inconsistent concurrency declarations refused before anything is created) |
 | DistributedOrchestratorTest | The end-to-end acceptance scenarios through the real path (registry → placement → leases → workers → runtime → aggregation): **A** 1 device/1 shard success; **B** 4 devices/4 shards all success with deterministic plans and zero leaked capacity; **C** two jobs with resource isolation; **D** one device offline → 3-device fallback placement that never targets the offline device; **E** one injected failure → retry on a DIFFERENT device → bit-exact success with the retry visible; **F** permanent failures → exactly max_attempts per shard then job Failed with honest 0-of-2 counts and no faked payload; **G** empty cluster → stable `cluster_empty` rejection, oversized shard → stable `insufficient_resource`; **H** unclaimed backend → stable `unsupported_capability`; **I** concurrent submissions from two threads → every job terminal, allocated ≤ capacity throughout, every lease returned; **J** full Platform integration (store job mirrors queued→running→completed + result metadata recorded, payload stays local, foreign users see nothing in either layer); plus submission idempotency/conflict rules, deterministic cancellation via a blocking transport + condition variables (in-flight shard completes, the rest cancelled, terminal cancel refused, foreign cancel invisible), stale plans never force-executed against a never-settling registry, threaded execution bit-exactness, and config rejection at creation (unknown policy, zero heartbeat timeout) with request-bound refusals |
 | DistributedContractTest | The distributed wire contract (C++ reference): the create-job parse (full + minimal bodies, exact fields), every violation with its stable code and HTTP status (invalid_json 400, missing/unknown fields, invalid enum/id/value, zero/fractional/negative shard counts, unsupported protocol 422, smuggled payload fields rejected — metadata only), byte-deterministic cluster-view/job/shard serialization verified by re-parsing (revision, distributed state/health vocabulary, capacity/allocated objects, failed-shard attempt/retry/failure_code on the wire, no payload keys), and the shared Phase 11 status mapping (200/400/404/422) |
+| TensorCoreTest | Phase 13 tensor foundation (every system, no GPU): the closed dtype vocabulary (stable names, byte widths, classes, fp64 explicitly absent, non-canonical names refused), N-D shapes (rank cap, negative dims, zero-element refusal, int64 overflow refused as `resource_limit_exceeded`, deterministic `describe`), canonical/strided layouts (span-bounded stride validation, negative strides refused, checked linear indexing with bounds), NumPy-style broadcasting (same-rank, rank expansion, singleton stretch, incompatible refusals — the exact implemented semantics), placement validation (identity reuse, canonical backends only, host-with-device-id refused, same-place semantics), TensorStorage through the Phase 4 resource system (allocation accounted in manager stats, exact-size whole-storage transfers, zero-element and byte-cap refusals, honest host/backend reporting), the Tensor value type (from_host round trip, element-count-preserving reshape of contiguous tensors, strided transpose/broadcast views sharing storage, storage-level view read semantics, UnsupportedLayout refusal on strided reshape — no hidden copy), metadata serialization (deterministic bytes, no payload keys, strict parse with unknown-field/dtype/placement refusal, device-id round trip), and RAII resource accounting (no leaks, allocation count exact) |
+| TensorOpsTest | Phase 13 op surface (every system): MatMul 2×3·3×2 hand-verified, K-mismatch refused with the rule named, rank mismatch refused, batched 3-D hand-verified; GEMM alpha/beta on a hand-computed case with C-shape enforcement; int32 elementwise add/subtract/multiply/divide exact, DEFINED modular overflow, truncating division, division-by-zero as the defined `numerical_validation_failure` domain error, NumPy-style broadcast add (2×3 + 3) verified; IEEE float divide semantics (+inf/NaN documented and tested); ReduceSum on one axis (fp32 exact, int32 modular) with axis-range and float-only ReduceMean policies; ReLU/Sigmoid/Tanh against known values with NaN propagation and int refusal; Softmax with max-subtraction stability on 1000-magnitude inputs, last-axis normalization on 2-D, non-finite input as an explicit domain error; materialized Transpose (incl. of a strided view) and element-count-preserving Reshape; mixed-dtype and wrong-arity refusals; fp16/bf16 promote-compute-round verified against the FP32 baseline (exact binary16 encodings, bf16 1+4=5 round-trip) |
+| TensorGraphTest | Phase 13 graphs (every system): deterministic insertion-order node ids and the graph caps; validation (unbound inputs, references to unknown nodes, dtype/shape inference violations caught at the offending node incl. cross-edge MatMul K mismatch); cycle detection over two-phase bindings (the error names the cycle); deterministic planning (two plans of the same graph structurally identical, smallest-id-first topological order, pinned output slots); the memory planner (liveness-safe reuse with no same-step read/write aliasing: a three-step chain plans TWO slots of 32 bytes vs the 48-byte fresh baseline, the output reuses a dead slot safely, planned vs naive accounting honest); bit-identical execution of the reused-slot plan vs the fresh-slot plan; the end-to-end graph ReLU(GEMM(A,B,C)) with real numbers (2·(1·3+2·4)=22), per-step traces with real steady-clock measurements, exact binding contracts (wrong shape → InvalidShape naming the slot, wrong dtype → DtypeMismatch) |
+| TensorDispatchTest | Phase 13 dispatch (every system): capability validation (duplicates, limits, `not_claimed` acceleration honesty), requirement satisfaction as the pure compatibility decision, the reference backend's REAL table (every op, all five dtypes, no acceleration claim); deterministic first-fit dispatch with the runtime adapter as head — int32 same-shape add routed through the REAL Phase 10 engine and verified bit-exact against `Runtime::execute` directly, int32 BROADCAST add capability-dispatched to the reference backend (the adapter does not claim broadcast); a restricted executor (built-in reference excluded) that refuses unlisted ops with `unsupported_operation` naming its table and unlisted dtypes with `unsupported_dtype`, while running its own op for real; null-manager/uninitialized-runtime construction refusals; the error vocabulary (stable snake_case codes, round-trip parsing, unique codes for every value, the documented bidirectional mapping to the compute status model) |
+| TensorDistributedTest | Phase 13 × Phase 12 integration (every system, no GPU, NO Phase 12 code modified): honest TensorDeviceProfile derivation from a device's own backend claims (no claims → supports nothing, unknown backends contribute nothing, cpu → the reference surface, cpu+vulkan → the union, acceleration never claimed, capacity stays the device's self-report); capability-based placement over a REAL `LocalDeviceRegistry` with two differently-claiming devices (deterministic first-fit, revision carried, backend-restricted selection, non-canonical backend → invalid_request, canonical-but-unclaimed → `unsupported_capability`, oversized memory → `insufficient_resource`, foreign owner → `cluster_empty` via the reused ownership filter, drained cluster → `device_unhealthy`); the offline-mid-flight scenario (the primary goes Offline after planning: the revision check exposes the stale plan and a FRESH placement deterministically selects the backup; both offline → deterministic refusal); retry determinism (re-executing the same matmul reproduces identical bytes); and transfer honesty (host + device executes with the output inheriting the device target, two different device placements refused with `transfer_unsupported`) |
 
 No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs pass the full suite.
 
@@ -622,8 +667,9 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | Implemented |
 | 0.10 | Compute Engine (generic elementwise ComputeTask layer: VectorAdd / VectorMultiply / VectorScale with bit-exact modular semantics, shared dispatch path, synchronous batch execution, CPU fork-join parallel execution, per-op benchmark capability, Phase 13 partitioning seam documented) | Implemented |
 | 0.11 | Platform / Cloud Layer Foundation (provider-neutral `vortyx::platform` layer: identity/metadata/job contracts, auth boundary with RLS-equivalent ownership, `IPlatformStore` + local/mock store, strict JSON + API contract codec pinned by tests on both sides; Supabase-ready schema + RLS migration; Vercel-ready API structure with local/mock mode; compute core untouched, deployment intentionally deferred) | Implemented |
-| 0.12 | Distributed / Multi-GPU Device System (provider-neutral `vortyx::distributed` layer over the platform: device registry with atomic leases and cluster revisions, deterministic sharding + three scheduling policies, workers over the unchanged Runtime, loopback transport, bounded retry with stable failure codes, duplicate-safe deterministic aggregation, Phase 11 store integration, local multi-device simulator + `vortyx_cluster` diagnostic; real network transport deliberately deferred) | **Implemented (current)** |
-| 1.0 | Local GPU Computing Platform | Planned |
+| 0.12 | Distributed / Multi-GPU Device System (provider-neutral `vortyx::distributed` layer over the platform: device registry with atomic leases and cluster revisions, deterministic sharding + three scheduling policies, workers over the unchanged Runtime, loopback transport, bounded retry with stable failure codes, duplicate-safe deterministic aggregation, Phase 11 store integration, local multi-device simulator + `vortyx_cluster` diagnostic; real network transport deliberately deferred) | Implemented |
+| 0.13 | AI/ML Acceleration + Tensor Layer (provider-neutral `vortyx::tensor` layer over the distributed layer: N-D tensors with checked shape/stride/broadcast arithmetic, five explicit dtypes with defined semantics, placement on the Phase 11/12 identity system, storage exclusively through the Phase 4 resource system, a validated op surface (matmul/gemm/elementwise+broadcast/reductions/activations/softmax/transpose/reshape) with deterministic CPU reference kernels, a runtime adapter into the REAL engine (CPU/Vulkan), TensorGraph with deterministic planning and liveness-safe memory-slot reuse, capability-based backend dispatch, and capability-based placement over Phase 12 snapshots; no hardware tensor kernels / fp64 / autograd / quantization / cross-device transfer — documented non-goals) | **Implemented (current)** |
+| 1.0 | Local GPU Computing Platform (tensor workloads across real backends, Phase 14+ production platform integration) | Planned |
 
 ## License
 

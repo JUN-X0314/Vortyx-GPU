@@ -1,6 +1,6 @@
 {
   "name": "@vortyx/platform-api",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "Vortyx GPU platform control-plane API (Phase 11+12: Vercel-ready structure, Supabase-ready adapter, local/mock mode)",
   "type": "module",

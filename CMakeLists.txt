@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.12.0
+    VERSION 0.13.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -22,6 +22,12 @@ option(VORTYX_ENABLE_PLATFORM "Build the Vortyx platform (control-plane) layer" 
 # workers and the local multi-device simulator. OFF — or PLATFORM=OFF,
 # which disables it automatically — reproduces the Phase 11 build exactly.
 option(VORTYX_ENABLE_DISTRIBUTED "Build the Vortyx distributed (multi-device) layer" ON)
+# Phase 13: the tensor (AI/ML acceleration) layer. Builds ON TOP of the
+# distributed layer (it reads cluster snapshots and reuses the platform
+# identity vocabulary) and the Phase 4 resource system (the ONLY allocation
+# path — no second memory world). OFF — or PLATFORM/DISTRIBUTED=OFF, which
+# disable it automatically — reproduces the Phase 12 build exactly.
+option(VORTYX_ENABLE_TENSOR "Build the Vortyx tensor (AI/ML acceleration) layer" ON)
 
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
@@ -162,6 +168,43 @@ if(VORTYX_ENABLE_DISTRIBUTED)
         )
         target_link_libraries(vortyx_cluster PRIVATE vortyx_distributed)
         target_compile_definitions(vortyx_cluster PRIVATE VORTYX_BUILD_CONFIG="$<CONFIG>")
+    endif()
+endif()
+
+# Tensor (AI/ML acceleration) layer (Phase 13).
+# A SEPARATE static library layered ON TOP of vortyx_distributed: the build
+# graph enforces the direction (tensor -> distributed -> platform -> core;
+# nothing below includes anything above). The tensor storage allocates
+# EXCLUSIVELY through the Phase 4 resource system, and the placement
+# integration reads Phase 12 snapshots read-only. No network code, no cloud
+# SDK, no fabricated hardware capability — the reference kernels are honest
+# CPU implementations and the runtime adapter routes into the REAL existing
+# engine. When the distributed layer is OFF — including the automatic
+# PLATFORM=OFF case — this layer is OFF with it and the build is exactly
+# Phase 12's.
+if(VORTYX_ENABLE_TENSOR)
+    if(NOT VORTYX_ENABLE_DISTRIBUTED)
+        message(STATUS "Vortyx: the distributed layer is OFF - the tensor layer is disabled with it")
+        set(VORTYX_ENABLE_TENSOR OFF)
+    else()
+        add_library(vortyx_tensor STATIC
+            src/tensor/status.cpp                 # tensor result vocabulary + mappings
+            src/tensor/dtype.cpp                  # DataType (fp32/fp16/bf16/int32/int8)
+            src/tensor/shape.cpp                  # shape/stride/broadcast (checked arithmetic)
+            src/tensor/placement.cpp              # device placement (Phase 11 identity reuse)
+            src/tensor/storage.cpp                # TensorStorage (Phase 4 resource system only)
+            src/tensor/tensor_value.cpp           # the Tensor value type + views
+            src/tensor/op.cpp                     # op vocabulary + the one rule set
+            src/tensor/capability.cpp             # capabilities / requirements
+            src/tensor/backend.cpp                # reference kernels + runtime adapter + dispatch
+            src/tensor/executor.cpp               # single-op execution facade
+            src/tensor/graph.cpp                  # TensorGraph + validation + topo order
+            src/tensor/plan.cpp                   # deterministic planner + memory planner
+            src/tensor/graph_executor.cpp         # planned graph execution
+            src/tensor/placement_integration.cpp  # Phase 12 capability-based placement
+            src/tensor/serialize.cpp              # metadata-only JSON (Phase 11 strict JSON)
+        )
+        target_link_libraries(vortyx_tensor PUBLIC vortyx_distributed)
     endif()
 endif()
 

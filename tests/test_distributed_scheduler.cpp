@@ -33,7 +33,7 @@ DeviceSnapshot make_device(const DeviceId& id, const UserId& owner, std::int64_t
     device.device_id = id;
     device.owner_user_id = owner;
     device.capabilities.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-    device.capabilities.metadata.software_version = "0.12.0";
+    device.capabilities.metadata.software_version = "0.13.0";
     device.capabilities.metadata.backends = {"cpu"};
     device.capabilities.metadata.operations = {"vector_add", "vector_multiply", "vector_scale"};
     device.capabilities.capacity.memory_bytes = memory_mb * 1024 * 1024;

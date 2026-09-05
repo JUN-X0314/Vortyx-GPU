@@ -169,3 +169,30 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-clang -C Release --output-on-failure
+
+  # Phase 13: the tensor layer is additive ON TOP of the distributed layer;
+  # with VORTYX_ENABLE_TENSOR=OFF the project must build and test exactly
+  # like Phase 12. A separate additive job keeps every existing job
+  # untouched (the matrix jobs above build with the tensor layer ON by
+  # default, so the tensor tests run on Windows/Ubuntu/Clang already).
+  build-no-tensor:
+    name: Build & Test Tensor=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, tensor disabled)
+        shell: bash
+        run: cmake -B build-no-tensor -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_TENSOR=OFF
+
+      - name: Build
+        run: cmake --build build-no-tensor --config Release
+
+      - name: Test
+        run: ctest --test-dir build-no-tensor -C Release --output-on-failure

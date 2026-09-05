@@ -182,3 +182,38 @@ if(VORTYX_ENABLE_DISTRIBUTED)
     target_link_libraries(test_distributed_contract PRIVATE vortyx_distributed)
     add_test(NAME DistributedContractTest COMMAND test_distributed_contract)
 endif()
+
+# Phase 13: AI/ML Acceleration + Tensor Layer.
+# - Tensor tests run on EVERY system (no GPU required — the reference
+#   kernels are host implementations): dtype/shape/layout/broadcast/storage
+#   (through the Phase 4 resource system), the full op surface against
+#   hand-verified values and FP32 baselines (fp16/bf16 via the documented
+#   promote-compute-round semantics), graph construction/validation/
+#   deterministic planning/memory-planner reuse safety/end-to-end graph
+#   execution, capability-based dispatch (including the runtime adapter
+#   routing int32 elementwise into the REAL engine), and the Phase 12
+#   integration (capability-based placement over a real registry,
+#   offline-mid-flight failover, retry determinism, transfer honesty).
+# - All limits and errors are explicit: unsupported ops/dtypes/devices are
+#   precise refusals, never skipped or guessed.
+if(VORTYX_ENABLE_TENSOR)
+    add_executable(test_tensor_core test_tensor_core.cpp)
+    target_link_libraries(test_tensor_core PRIVATE vortyx_tensor)
+    add_test(NAME TensorCoreTest COMMAND test_tensor_core)
+
+    add_executable(test_tensor_ops test_tensor_ops.cpp)
+    target_link_libraries(test_tensor_ops PRIVATE vortyx_tensor)
+    add_test(NAME TensorOpsTest COMMAND test_tensor_ops)
+
+    add_executable(test_tensor_graph test_tensor_graph.cpp)
+    target_link_libraries(test_tensor_graph PRIVATE vortyx_tensor)
+    add_test(NAME TensorGraphTest COMMAND test_tensor_graph)
+
+    add_executable(test_tensor_dispatch test_tensor_dispatch.cpp)
+    target_link_libraries(test_tensor_dispatch PRIVATE vortyx_tensor)
+    add_test(NAME TensorDispatchTest COMMAND test_tensor_dispatch)
+
+    add_executable(test_tensor_distributed test_tensor_distributed.cpp)
+    target_link_libraries(test_tensor_distributed PRIVATE vortyx_tensor)
+    add_test(NAME TensorDistributedTest COMMAND test_tensor_distributed)
+endif()

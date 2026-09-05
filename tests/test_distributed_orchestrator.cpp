@@ -51,7 +51,7 @@ void check(bool condition, const std::string& message) {
 DeviceCapabilities caps(std::int64_t memory_mb, std::int64_t jobs) {
     DeviceCapabilities c;
     c.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-    c.metadata.software_version = "0.12.0";
+    c.metadata.software_version = "0.13.0";
     c.metadata.backends = {"cpu"};
     c.metadata.operations = {"vector_add", "vector_multiply", "vector_scale"};
     c.metadata.display_name = "test";

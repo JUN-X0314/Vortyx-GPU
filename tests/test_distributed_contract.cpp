@@ -163,7 +163,7 @@ int main() {
         device.device_id = "device-0";
         device.owner_user_id = "user";
         device.capabilities.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-        device.capabilities.metadata.software_version = "0.12.0";
+        device.capabilities.metadata.software_version = "0.13.0";
         device.capabilities.metadata.backends = {"cpu"};
         device.capabilities.metadata.operations = {"vector_add"};
         device.capabilities.capacity.memory_bytes = 8 * 1024 * 1024;

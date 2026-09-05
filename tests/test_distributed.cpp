@@ -32,7 +32,7 @@ DeviceCapabilities caps(std::int64_t memory_mb, std::int64_t jobs,
                         const std::vector<std::string>& backends = {"cpu"}) {
     DeviceCapabilities c;
     c.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-    c.metadata.software_version = "0.12.0";
+    c.metadata.software_version = "0.13.0";
     c.metadata.operating_system = "linux";
     c.metadata.architecture = "x86_64";
     c.metadata.backends = backends;
