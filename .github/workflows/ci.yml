@@ -119,3 +119,53 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-cpu-only -C Release --output-on-failure
+
+  # Phase 12: the platform=OFF guarantee is re-verified additively — with
+  # VORTYX_ENABLE_PLATFORM=OFF the distributed layer disables itself with
+  # the platform layer and the project must build and test exactly like
+  # Phase 10 (19 tests, no platform/distributed targets). A separate
+  # additive job keeps every existing job untouched.
+  build-no-platform:
+    name: Build & Test Platform=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, platform disabled)
+        shell: bash
+        run: cmake -B build-no-platform -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_PLATFORM=OFF
+
+      - name: Build
+        run: cmake --build build-no-platform --config Release
+
+      - name: Test
+        run: ctest --test-dir build-no-platform -C Release --output-on-failure
+
+  # Phase 12: a Clang build on Linux (the spec asks for Clang coverage when
+  # available; additive — the existing matrix jobs are unchanged).
+  build-clang:
+    name: Build & Test (Clang, Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Vulkan loader + software device (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers clang
+
+      - name: Configure (CMake, Clang)
+        shell: bash
+        run: CC=clang CXX=clang++ cmake -B build-clang -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-clang --config Release -j2
+
+      - name: Test
+        run: ctest --test-dir build-clang -C Release --output-on-failure

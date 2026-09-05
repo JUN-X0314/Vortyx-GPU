@@ -459,3 +459,190 @@ export function platformInfo(softwareVersion: string): Record<string, unknown> {
     backends: [...KNOWN_BACKENDS],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Distributed surface (Phase 12) — the wire contract for the distributed
+// endpoints, mirroring src/distributed/contract_distributed.* field for
+// field: same schemas, same error codes, same status mapping. Metadata
+// only — a distributed submission carries NO compute payload, and any
+// unknown field is rejected.
+// ---------------------------------------------------------------------------
+
+import type {
+  ClusterView,
+  DistributedJobRecord,
+  DistributedShardRecord,
+} from "./distributed.ts";
+import type { DeviceView } from "./distributed.ts";
+
+const CREATE_DISTRIBUTED_JOB_FIELDS = [
+  "job_id",
+  "operation",
+  "element_count",
+  "requested_shard_count",
+  "requested_backend",
+  "priority",
+  "protocol_version",
+  "created_at_ms",
+] as const;
+
+export interface CreateDistributedJobRequest {
+  envelope: JobEnvelope;
+  requested_shard_count: number;
+}
+
+export function parseCreateDistributedJob(body: unknown): ParseResult<CreateDistributedJobRequest> {
+  if (!isJsonObject(body)) {
+    return fail(ERR_INVALID_TYPE, "request body must be a JSON object");
+  }
+  const unknown = rejectUnknownFields(body, CREATE_DISTRIBUTED_JOB_FIELDS);
+  if (!unknown.ok) return unknown;
+
+  const job_id = requireString(body, "job_id");
+  if (!job_id.ok) return job_id;
+  const operation = requireString(body, "operation");
+  if (!operation.ok) return operation;
+  const element_count = requireIntegralNumber(body, "element_count");
+  if (!element_count.ok) return element_count;
+  // The multi-device choice is EXPLICIT on the distributed surface.
+  const requested_shard_count = requireIntegralNumber(body, "requested_shard_count");
+  if (!requested_shard_count.ok) return requested_shard_count;
+  const requested_backend = optionalString(body, "requested_backend", "");
+  if (!requested_backend.ok) return requested_backend;
+  const priority = optionalIntegralNumber(body, "priority");
+  if (!priority.ok) return priority;
+  const protocol_version = requireString(body, "protocol_version");
+  if (!protocol_version.ok) return protocol_version;
+  const created_at_ms = optionalIntegralNumber(body, "created_at_ms");
+  if (!created_at_ms.ok) return created_at_ms;
+
+  if (!isValidId(job_id.value)) {
+    return fail(ERR_INVALID_ID, "job_id is invalid (allowed: A-Z a-z 0-9 . _ -, length 1..128)");
+  }
+  if (!(KNOWN_OPERATIONS as readonly string[]).includes(operation.value)) {
+    return fail(ERR_INVALID_ENUM, `unknown operation '${operation.value}'`);
+  }
+  if (element_count.value <= 0) {
+    return fail(ERR_INVALID_VALUE, "field 'element_count' must be greater than 0");
+  }
+  if (element_count.value > MAX_JOB_ELEMENT_COUNT) {
+    return fail(
+      ERR_INVALID_VALUE,
+      `element_count exceeds the control-plane contract cap (${MAX_JOB_ELEMENT_COUNT})`,
+    );
+  }
+  if (requested_shard_count.value < 1 || requested_shard_count.value > 4294967295) {
+    return fail(
+      ERR_INVALID_VALUE,
+      "field 'requested_shard_count' must be between 1 and 2^32-1",
+    );
+  }
+  if (
+    requested_backend.value !== "" &&
+    !(KNOWN_BACKENDS as readonly string[]).includes(requested_backend.value)
+  ) {
+    return fail(
+      ERR_INVALID_ENUM,
+      `unknown requested_backend '${requested_backend.value}' (known: cpu, vulkan)`,
+    );
+  }
+  const parsedPriority = priority.value ?? 0;
+  if (parsedPriority < -2147483648 || parsedPriority > 2147483647) {
+    return fail(ERR_INVALID_VALUE, "field 'priority' must fit a signed 32-bit integer");
+  }
+  if (protocol_version.value !== PROTOCOL_VERSION) {
+    return fail(
+      ERR_UNSUPPORTED_PROTOCOL,
+      `unsupported protocol version '${protocol_version.value}' (this control plane speaks '${PROTOCOL_VERSION}')`,
+    );
+  }
+
+  return {
+    ok: true,
+    value: {
+      envelope: {
+        job_id: job_id.value,
+        operation: operation.value as JobEnvelope["operation"],
+        element_count: element_count.value,
+        requested_backend: requested_backend.value,
+        priority: parsedPriority,
+        protocol_version: protocol_version.value,
+        created_at_ms: created_at_ms.value,
+      },
+      requested_shard_count: requested_shard_count.value,
+    },
+  };
+}
+
+function serializeShardEntry(shard: DistributedShardRecord): Record<string, unknown> {
+  return {
+    shard_id: shard.shard_id,
+    index: shard.index,
+    state: shard.state,
+    element_begin: shard.element_begin,
+    element_end: shard.element_end,
+    device_id: shard.device_id,
+    attempt: shard.attempt,
+    retry_count: shard.retry_count,
+    failure_code: shard.failure_code,
+  };
+}
+
+/** One distributed job (GET /api/distributed/jobs/:id and list entries). */
+export function serializeDistributedJob(record: DistributedJobRecord): Record<string, unknown> {
+  return {
+    job_id: record.job_id,
+    operation: record.operation,
+    element_count: record.element_count,
+    requested_backend: record.requested_backend,
+    requested_shard_count: record.requested_shard_count,
+    status: record.status,
+    error: record.error,
+    shards: record.shards.map(serializeShardEntry),
+    shard_count: record.shards.length,
+    succeeded: record.shards.filter((shard) => shard.state === "completed").length,
+    failed: record.shards.filter((shard) => shard.state === "failed").length,
+    cancelled: record.shards.filter((shard) => shard.state === "cancelled").length,
+    created_at_ms: record.created_at_ms,
+    completed_at_ms: record.completed_at_ms,
+  };
+}
+
+/** The shard table alone (GET /api/distributed/jobs/:id/shards). */
+export function serializeDistributedShards(
+  record: DistributedJobRecord,
+): Record<string, unknown> {
+  return {
+    job_id: record.job_id,
+    shards: record.shards.map(serializeShardEntry),
+  };
+}
+
+function serializeResourceVector(vector: {
+  compute_units: number;
+  memory_bytes: number;
+  concurrent_jobs: number;
+}): Record<string, unknown> {
+  return {
+    compute_units: vector.compute_units,
+    memory_bytes: vector.memory_bytes,
+    concurrent_jobs: vector.concurrent_jobs,
+  };
+}
+
+/** GET /api/cluster payload (the caller's device scheduling view). */
+export function serializeClusterView(view: ClusterView): Record<string, unknown> {
+  return {
+    revision: view.revision,
+    devices: view.devices.map((device: DeviceView) => ({
+      device_id: device.device_id,
+      state: device.state,
+      health: device.health,
+      capacity: serializeResourceVector(device.capacity),
+      allocated: serializeResourceVector(device.allocated),
+      backends: device.backends,
+      running_shards: device.running_shards,
+      last_heartbeat_ms: device.last_heartbeat_ms,
+    })),
+  };
+}

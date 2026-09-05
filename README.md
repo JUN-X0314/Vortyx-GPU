@@ -6,20 +6,17 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 11 (v0.11.0) — Platform / Cloud Layer Foundation
+## Current Phase: Phase 12 (v0.12.0) — Distributed / Multi-GPU Device System
 
-Phase 11 builds the **Platform Control Plane Foundation**: the stable boundary between today's local compute engine and the future multi-device / distributed phases. It adds a provider-neutral platform layer (`vortyx::platform`, `src/platform/`) — device identity, self-reported metadata, the job submission/status/result contracts, an authentication/authorization boundary, a provider-neutral `IPlatformStore` with a local/mock reference implementation, a strict standard-library JSON module, and the API contract codec — plus a Supabase-ready schema with Row Level Security (`platform/supabase/migrations/`) and a Vercel-ready API structure (`platform/api/`, TypeScript). The compute core knows nothing about any of it.
+Phase 12 builds the **Distributed / Multi-GPU Device System**: several logical Vortyx devices are managed as one compute cluster through a new provider-neutral, transport-neutral layer (`vortyx::distributed`, `src/distributed/`) layered ON TOP of the unchanged Phase 11 platform and the unchanged compute core. A device registry with atomic resource leases holds the cluster; deterministic scheduling policies (`round_robin` / `least_loaded` / `capability_fit`) place the shards of one logical job onto capable devices from immutable cluster snapshots; workers execute shards **through the unchanged local compute path** (one exclusive Runtime per device); failures are classified by a stable code vocabulary and retried under a bounded, explicit policy that never re-runs succeeded shards; and shard results are reassembled into one deterministic logical result with duplicate-safe aggregation. The local multi-device simulator and the `vortyx_cluster` diagnostic tool prove the whole flow end to end without any GPU hardware or network.
 
-- **Provider-neutral, never Supabase-shaped**: the API layer speaks only `IPlatformStore`; concrete providers live behind it. The C++ repository ships no provider implementation and the platform layer adds zero external dependencies (standard library only). `VORTYX_ENABLE_PLATFORM=OFF` builds exactly like Phase 10.
-- **Core purity enforced by the build graph**: `vortyx_core` never links or includes `vortyx_platform`. No Supabase/Vercel/HTTP/JSON/JWT knowledge exists anywhere below the platform boundary.
-- **`ComputeTask` ≠ `JobEnvelope`**: the local execution object keeps its data and its path; the transport contract carries only metadata (which operation, how big, who wants it) and deliberately no payload. They share exactly one thing — the operation vocabulary (`ComputeOp` labels), so names cannot drift.
-- **Honest job lifecycle**: `JobStatus` (queued → running → completed/failed/cancelled) is the control-plane lifecycle, deliberately separate from the Phase 6 TaskQueue's `TaskState`. Transitions are a documented, tested table; failures require a reason; terminal states are final everywhere (store, API, database CHECK constraints).
-- **AuthN/AuthZ boundary with defense in depth**: verified subject ≠ client-claimed id; the single ownership rule (`auth.uid() = owner_user_id`) is enforced identically by the store layer, the API layer and Supabase RLS. Foreign records are INVISIBLE (404, RLS equivalence) — never a 403 that would leak which ids exist.
-- **Local/mock mode is honest**: `InMemoryPlatformStore` persists nothing and says so; the local token scheme (`Bearer local:<user_id>`) is a development convenience, loudly documented. No Supabase account, no Vercel project and no secrets are needed to build, test or run anything in Phase 11.
-- **Strict JSON + contract codec in C++**: the wire contract is implemented twice (C++ and TypeScript) and pinned by tests on BOTH sides — same routes, same schemas, same error codes (`invalid_json`, `missing_field`, `invalid_enum`, …), same status mapping (400/401/403/404/405/409/422/500).
-- **No fake telemetry**: device capabilities are self-reported and vocabulary-validated; capacity/battery/load fields do not exist yet and are documented as Phase 12+ seams. `JobEnvelope::priority` is a RESERVED transport field that nothing reads.
-
-**Actual Supabase project configuration and Vercel deployment are intentionally deferred until after Phase 11 implementation.** The schema, migration, RLS policies, environment-variable design, deployment checklist and local/mock development flow are all in place and documented (`docs/platform/`).
+- **Additive by construction**: `vortyx_distributed → vortyx_platform → vortyx_core` in the build graph; the core never sees any upper layer. `VORTYX_ENABLE_DISTRIBUTED=OFF` — or `VORTYX_ENABLE_PLATFORM=OFF`, which disables it automatically — reproduces the previous build exactly, and no existing API, test or behavior changed.
+- **Reuse over redefinition**: device identity/ownership/metadata are the Phase 11 `DeviceId/UserId/DeviceMetadata`; the submission contract is the Phase 11 `JobEnvelope`; the optional platform integration speaks only `IPlatformStore` with the submitter's own `AuthContext`. One vocabulary everywhere; `ComputeTask` still stays local and never travels the control plane.
+- **Determinism first**: sharding is property-tested (exact coverage, no overlap, no empty shards, balanced sizes, stable shard ids); policies are pure functions over snapshots; every timeout reads an injectable clock; the test suite contains zero sleeps.
+- **Honest failure semantics**: stable failure codes, a bounded retry ceiling (infinite retry is impossible by construction), retries re-placed away from the failed device, partial failure is a failure (never disguised), duplicates are visible and never double-counted, and every placement rejection carries a stable code (`cluster_empty`, `unsupported_capability`, `no_device_available`, `insufficient_resource`, `device_unhealthy`, `stale_plan`).
+- **Stale plans are never force-executed**: a plan records the cluster revision it was computed from; the orchestrator re-plans a bounded number of times when the cluster moves under it, then reports the instability.
+- **No fake capabilities**: device capacities are self-reported configuration; a simulated device's backend list is the honest answer of a real Runtime on the host; unknown capability or health never matches a placement.
+- **Documented non-goals**: no real network transport (the loopback is the only `IWorkerTransport`), no consensus, no work stealing, no priority scheduling, no measured-performance scheduling, no hardware topology discovery. `docs/distributed/` states exactly what exists and what does not.
 
 **Not implemented in Phase 11 (by design)**: distributed execution, multi-device execution, remote workers, work stealing, resource-aware scheduling, task partitioning, real-time device telemetry, remote execution of submitted jobs (a submitted job is `queued` and currently ends there — execution arrives with the Phase 12+ device agents).
 
@@ -34,6 +31,12 @@ Resource Monitor ── observes the Runtime / Device / allocation state (read-o
 Platform (Phase 11) ── identity · metadata · job contract · auth boundary
             └─ IPlatformStore → InMemoryPlatformStore (local/mock) | (behind the seam) Supabase + Vercel API
                (the compute path knows NOTHING about this layer)
+
+Distributed (Phase 12) ── one cluster of logical devices, orchestrated end to end
+            └─ Orchestrator → DeviceRegistry (leases · snapshots) → Scheduling Policies → Sharding
+                            → Workers (LocalWorker → the unchanged Runtime, one per device) → Aggregation
+               Transport: IWorkerTransport (in-process loopback only — no network in Phase 12)
+               (the compute path still knows NOTHING about any of this)
 ```
 
 ## Phase 10 — Compute Engine (v0.10.0, kept in force)
@@ -324,8 +327,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.11.0
-  Phase:   11 (Platform Foundation)
+  Version: 0.12.0
+  Phase:   12 (Distributed / Multi-GPU Device System)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -467,8 +470,8 @@ On a machine without any Vulkan device (or in a CPU-only build), the program ins
 
 ```
 Vortyx-GPU/
-├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible, platform-api job)
-├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN, VORTYX_ENABLE_PLATFORM options)
+├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible, platform-api + no-platform + clang jobs)
+├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN / _PLATFORM / _DISTRIBUTED options)
 ├── shaders/
 │   ├── vector_add.comp             # Vector addition compute kernel (GLSL source)
 │   ├── vector_multiply.comp        # Phase 10 elementwise multiply kernel
@@ -476,7 +479,8 @@ Vortyx-GPU/
 ├── scripts/
 │   └── embed_spv.py                # Embeds compiled SPIR-V into a C++ header
 ├── src/
-│   ├── main.cpp                    # Discovery + Virtual GPU + Queue + Scheduler demo + Phase 8 benchmark/monitoring demo
+│   ├── main.cpp                    # Discovery + Virtual GPU + Queue + Scheduler demo + Phase 8/10/11 demos
+│   ├── cluster_main.cpp            # vortyx_cluster: Phase 12 distributed diagnostic tool (manual run)
 │   ├── benchmark_main.cpp          # vortyx_bench: standalone benchmark tool (manual run, not a CI test)
 │   ├── core/                       # THE COMPUTE PATH (knows nothing about the platform layer)
 │   │   ├── version.hpp / logger.*  # Phase 1 utilities
@@ -516,15 +520,45 @@ Vortyx-GPU/
 │       ├── memory_store.*          # InMemoryPlatformStore (local/mock reference implementation)
 │       ├── json.*                  # Minimal strict JSON (adapter boundary; no external dependency)
 │       └── contract.*              # API contract codec: request/response/error/status mapping
+│   └── distributed/                # PHASE 12 Distributed / Multi-GPU Device System (separate static lib)
+│       ├── distributed.hpp         # Umbrella header + documented layering/dependency rules
+│       ├── clock.*                 # Injectable monotonic time (SteadyClock / FakeClock)
+│       ├── resource.*              # ResourceVector + checked invariants (capacity/fit/release)
+│       ├── device.*                # Device state machine, health, capability claims (Phase 11 types reused)
+│       ├── lease.*                 # DeviceLease + RAII LeaseGuard
+│       ├── registry.*              # IDeviceRegistry + LocalDeviceRegistry (idempotent, atomic leases)
+│       ├── cluster.*               # Immutable ClusterSnapshot + ownership-filtered views
+│       ├── topology.hpp            # Device-link seam (static provider; unknown = unknown)
+│       ├── shard.*                 # WorkPartition (element ranges) + shard state machine
+│       ├── job.*                   # Distributed job lifecycle + derivation + Phase 11 mapping
+│       ├── retry.*                 # FailureCode vocabulary + bounded RetryPolicy
+│       ├── policy.*                # ISchedulingPolicy: round_robin / least_loaded / capability_fit
+│       ├── worker.*                # LocalWorker → the unchanged Runtime (adapter, slicing)
+│       ├── transport.*             # IWorkerTransport + LocalInProcessTransport (loopback only)
+│       ├── aggregator.*            # Duplicate-safe deterministic result aggregation
+│       ├── heartbeat.*             # Liveness judgments on the injected clock
+│       ├── orchestrator.*          # The whole flow (placement → execution → retry → terminal)
+│       ├── config.*                # VORTYX_DISTRIBUTED_* environment parsing (explicit rejection)
+│       ├── simulator.*             # Local multi-device simulator (honest Runtime-probed claims)
+│       ├── debug.*                 # Deterministic diagnostic dumps
+│       └── contract_distributed.*  # Distributed wire contract codec (C++ side)
 ├── platform/                       # Cloud platform layer (not part of the CMake build)
 │   ├── api/                        # Vercel-ready API (TypeScript): api/ routes, src/ logic,
 │   │                               #   test/ node:test suite, dev-server.mjs local/mock mode
 │   └── supabase/migrations/        # Real PostgreSQL schema + RLS policies (applied post-Phase-11)
 ├── docs/platform/                  # architecture / api contract / database+RLS / security /
 │                                   #   local development / deployment checklist
+├── docs/distributed/               # Phase 12: architecture / device-model / scheduling /
+│                                   #   failure-handling / api / local-development
 └── tests/
     ├── test_platform.cpp           # Phase 11 platform models + store + authz: must pass everywhere
     ├── test_platform_contract.cpp  # Phase 11 wire contract (JSON, errors, parsers, serializers)
+    ├── test_distributed.cpp                # Phase 12 device/resource/registry/lease/heartbeat models
+    ├── test_distributed_scheduler.cpp      # Phase 12 sharding invariants + policies + rejections
+    ├── test_distributed_jobs.cpp           # Phase 12 shard/job state machines + retry + aggregation
+    ├── test_distributed_worker.cpp         # Phase 12 worker slicing bit-exactness + transport + simulator
+    ├── test_distributed_orchestrator.cpp   # Phase 12 acceptance scenarios A~J end to end
+    ├── test_distributed_contract.cpp       # Phase 12 distributed wire contract (C++ side)
     ├── test_compute_tasks.cpp     # Phase 10 Compute Engine CPU path: must pass everywhere
     ├── test_compute_tasks_gpu.cpp # Phase 10 Compute Engine GPU path: real tests when Vulkan available
     ├── ... (Phase 1~9 tests unchanged)
@@ -538,7 +572,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.11.0 |
+| VersionTest | Version constants match 0.12.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -559,6 +593,12 @@ ctest --test-dir build -C Release --output-on-failure
 | MonitorGpuTest | When a Vulkan device exists: the snapshot observes the vulkan backend exactly as the Runtime and the executing Virtual GPU report it (availability, DeviceInfo equality, honest `Gpu`/`SoftwareGpu` kind), real Vulkan execution between snapshots changes no observation except allocation accounting (which returns to zero live buffers — RAII intact). Without a device: explicit SKIP note (never faked success) |
 | PlatformTest | Platform layer CPU path (every system): id syntax + UUID v4 generation/uniqueness, metadata validation (protocol version, capability vocabulary, duplicates, caps), the job status vocabulary + the documented transition table, envelope/result validation (zero-element refusal, failure-requires-reason honesty), the auth boundary (AuthN vs AuthZ, owner/foreign/anonymous), the full `InMemoryPlatformStore` contract — registration with server-managed fields, duplicate conflicts without owner leakage, ownership-filtered lists in insertion order, heartbeats, job idempotency (identical replay returns the existing record; different payload/owner → conflict), foreign/unknown submitting devices Forbidden without existence leaks, lifecycle transitions incl. illegal ones and cancellation, single-outcome result recording with the RLS-equivalence rule (foreign records are NotFound, never Forbidden), and concurrent store use (4 threads × 25 registrations land exactly once; same-id races produce exactly one record) |
 | PlatformContractTest | The wire contract the Vercel API layer mirrors: strict JSON module (full escape/surrogate handling, ~25 malformed-input rejections with reasons, depth cap, byte-stable deterministic serialization, round trips, duplicate-key last-wins), the unified error schema, the HTTP status mapping (400/401/403/404/409/422/500), `store_error_code` vocabulary, request parsers (register device / create job: valid full + minimal bodies, missing fields, wrong types, invalid enums, invalid ids, unsupported protocol versions, unknown-field rejection), response serializers (documented field order, exact values, null for unset timestamps, platform-info vocabulary), and a full local round trip (parse → store → serialize → parse, incl. foreign-read invisibility and idempotent resubmission) |
+| DistributedTest | Distributed foundation (every system, no GPU): the device state machine (every documented transition + key refusals: no silent revival from Offline/Failed, no self-transitions), schedulability vocabulary, capability validation against the Phase 11 metadata rules + claims-only matching (empty claims support nothing, unknown backend/op refused, preferred backend derivation), ResourceVector invariants (validity, fit at the exact boundary, add/sub with zero clamp, per-op honest shard memory with overflow refusal, stable debug string), the registry (fresh Registering/Unknown honesty, idempotent identical re-registration with liveness/activation semantics, owner/payload conflicts without owner leakage, foreign invisibility, deterministic registration-order listings, transition-table-enforced activation, heartbeat recovery of offline devices, unregister pinned by active leases, capability changes under live leases refused), reservation gates (over-memory/over-concurrency refused with the honest reason, deterministic lease ids, expiry = created + ttl, mismatched/double release refused, released records leave the registry, busy schedulable while capacity remains, draining/offline refuse), lease expiry reclaimed on the FakeClock with capacity freed, LeaseGuard RAII (release on scope exit, detach hands over), the heartbeat monitor (fresh within timeout, stale judged Unhealthy+Offline once, no double counting, heartbeat recovery, failed devices left to their own path, ownership scoping), snapshot revision monotonicity + candidate filtering (ownership/state/health), and concurrency (4 threads × 25 registrations land exactly once with no leaked reservations) |
+| DistributedSchedulerTest | Deterministic scheduling (pure functions, no hardware/clock/threads): the partition property over many (N, K) pairs (exact coverage, no overlap/gaps, no empty shards when K > N, sizes balanced within 1, byte-identical determinism, zero-element/zero-shard refusals), shard id derivation (deterministic `<job>-s<index>`, charset shape checks, cap overflow refused not truncated), RoundRobin (one shard per capable device, recorded cluster revision, fresh-policy reproducibility, cursor rotation across calls), LeastLoaded (fewest allocated jobs then memory, tie-break by registration order), CapabilityFit (tightest memory slack), every stable rejection code (invalid_request / cluster_empty / device_unhealthy / unsupported_capability / no_device_available with fallback off / insufficient_resource), unknown policy names refused, fallback semantics (coalesce to existing devices, single-device multi-shard request, K>N caps, 1-element jobs), snapshot candidacy filters (ownership/state/health), and the topology seam (no fabricated links, undirected lookup, unknown pairs, unreported bandwidth/latency stay unknown) |
+| DistributedJobsTest | Job machinery semantics (pure functions): the full shard state machine (every legal transition incl. stale-plan assigned→pending, terminal finality), the job status derivation rules (empty→queued, pending/retrying→planning, assigned→scheduled, running→running, all-completed→completed, partial failure→failed — never disguised, failure outranks cancellation outranks success, unfinished outranks failed), terminal refusal of revival transitions, the honest Phase 11 mapping (planning/scheduled/running collapse to running; no new platform state), failure codes (stable snake_case names, parse round-trip, the retryable/non-retryable classifier, duplicate visible but not a failure), the retry policy (exponential backoff with the 60s clamp, attempt-ceiling semantics with no unbounded mode), and the ResultAggregator (shard-order reassembly bit-correct regardless of arrival order, duplicate first-verdict-wins with counts, unexpected shard indices, partial failure NOT completed with honest counts + failed-shard records + no faked payload, cancellations tracked separately) |
+| DistributedWorkerTest | Worker/transport/simulator (every system, CPU backend): the LocalWorker lifecycle (Starting/Ready/Running/Draining/Stopped, refusal with real reasons before start/while draining/after stop, idempotent start), **slicing bit-exactness — slice → execute → reassemble equals the full-range execution for all three ops at a non-multiple size**, assignment validation (wrong device, empty range, out-of-domain range, unclaimed operation, unknown explicit backend refused without fallback, available explicit backend honored, identity carried on results), the loopback transport (dispatch, device-less ghost = device_lost, worker_for resolution, one worker per device, deterministic failure injection that fires BEFORE the worker and decrements visibly, cancel recording), and the local multi-device simulator (honest backend claims from a real Runtime probe — cpu always, canonical names only, activation to Ready+Healthy, conflicting re-registration refused, identical re-registration replayed, inconsistent concurrency declarations refused before anything is created) |
+| DistributedOrchestratorTest | The end-to-end acceptance scenarios through the real path (registry → placement → leases → workers → runtime → aggregation): **A** 1 device/1 shard success; **B** 4 devices/4 shards all success with deterministic plans and zero leaked capacity; **C** two jobs with resource isolation; **D** one device offline → 3-device fallback placement that never targets the offline device; **E** one injected failure → retry on a DIFFERENT device → bit-exact success with the retry visible; **F** permanent failures → exactly max_attempts per shard then job Failed with honest 0-of-2 counts and no faked payload; **G** empty cluster → stable `cluster_empty` rejection, oversized shard → stable `insufficient_resource`; **H** unclaimed backend → stable `unsupported_capability`; **I** concurrent submissions from two threads → every job terminal, allocated ≤ capacity throughout, every lease returned; **J** full Platform integration (store job mirrors queued→running→completed + result metadata recorded, payload stays local, foreign users see nothing in either layer); plus submission idempotency/conflict rules, deterministic cancellation via a blocking transport + condition variables (in-flight shard completes, the rest cancelled, terminal cancel refused, foreign cancel invisible), stale plans never force-executed against a never-settling registry, threaded execution bit-exactness, and config rejection at creation (unknown policy, zero heartbeat timeout) with request-bound refusals |
+| DistributedContractTest | The distributed wire contract (C++ reference): the create-job parse (full + minimal bodies, exact fields), every violation with its stable code and HTTP status (invalid_json 400, missing/unknown fields, invalid enum/id/value, zero/fractional/negative shard counts, unsupported protocol 422, smuggled payload fields rejected — metadata only), byte-deterministic cluster-view/job/shard serialization verified by re-parsing (revision, distributed state/health vocabulary, capacity/allocated objects, failed-shard attempt/retry/failure_code on the wire, no payload keys), and the shared Phase 11 status mapping (200/400/404/422) |
 
 No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs pass the full suite.
 
@@ -581,7 +621,8 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | Implemented |
 | 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | Implemented |
 | 0.10 | Compute Engine (generic elementwise ComputeTask layer: VectorAdd / VectorMultiply / VectorScale with bit-exact modular semantics, shared dispatch path, synchronous batch execution, CPU fork-join parallel execution, per-op benchmark capability, Phase 13 partitioning seam documented) | Implemented |
-| 0.11 | Platform / Cloud Layer Foundation (provider-neutral `vortyx::platform` layer: identity/metadata/job contracts, auth boundary with RLS-equivalent ownership, `IPlatformStore` + local/mock store, strict JSON + API contract codec pinned by tests on both sides; Supabase-ready schema + RLS migration; Vercel-ready API structure with local/mock mode; compute core untouched, deployment intentionally deferred) | **Implemented (current)** |
+| 0.11 | Platform / Cloud Layer Foundation (provider-neutral `vortyx::platform` layer: identity/metadata/job contracts, auth boundary with RLS-equivalent ownership, `IPlatformStore` + local/mock store, strict JSON + API contract codec pinned by tests on both sides; Supabase-ready schema + RLS migration; Vercel-ready API structure with local/mock mode; compute core untouched, deployment intentionally deferred) | Implemented |
+| 0.12 | Distributed / Multi-GPU Device System (provider-neutral `vortyx::distributed` layer over the platform: device registry with atomic leases and cluster revisions, deterministic sharding + three scheduling policies, workers over the unchanged Runtime, loopback transport, bounded retry with stable failure codes, duplicate-safe deterministic aggregation, Phase 11 store integration, local multi-device simulator + `vortyx_cluster` diagnostic; real network transport deliberately deferred) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform | Planned |
 
 ## License

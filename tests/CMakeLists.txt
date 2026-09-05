@@ -146,3 +146,39 @@ if(VORTYX_ENABLE_PLATFORM)
     target_link_libraries(test_platform_contract PRIVATE vortyx_platform)
     add_test(NAME PlatformContractTest COMMAND test_platform_contract)
 endif()
+
+# Phase 12: Distributed / Multi-GPU Device System.
+# - Distributed tests run on EVERY system (no GPU required): device state
+#   machine, resource invariants, registry (idempotent registration,
+#   leases, expiry, revision), scheduling policies, shard partition
+#   invariants, job/retry/aggregation semantics, worker slicing (bit-exact
+#   against the full-range reference), the local multi-device simulator,
+#   the orchestrator end-to-end scenarios (single-device, multi-device,
+#   failure/retry, partial failure, cancellation, platform integration)
+#   and the distributed wire contract. All time-dependent behavior is
+#   tested with an injected FakeClock — no sleeps, no flaky timing.
+if(VORTYX_ENABLE_DISTRIBUTED)
+    add_executable(test_distributed test_distributed.cpp)
+    target_link_libraries(test_distributed PRIVATE vortyx_distributed)
+    add_test(NAME DistributedTest COMMAND test_distributed)
+
+    add_executable(test_distributed_scheduler test_distributed_scheduler.cpp)
+    target_link_libraries(test_distributed_scheduler PRIVATE vortyx_distributed)
+    add_test(NAME DistributedSchedulerTest COMMAND test_distributed_scheduler)
+
+    add_executable(test_distributed_jobs test_distributed_jobs.cpp)
+    target_link_libraries(test_distributed_jobs PRIVATE vortyx_distributed)
+    add_test(NAME DistributedJobsTest COMMAND test_distributed_jobs)
+
+    add_executable(test_distributed_worker test_distributed_worker.cpp)
+    target_link_libraries(test_distributed_worker PRIVATE vortyx_distributed)
+    add_test(NAME DistributedWorkerTest COMMAND test_distributed_worker)
+
+    add_executable(test_distributed_orchestrator test_distributed_orchestrator.cpp)
+    target_link_libraries(test_distributed_orchestrator PRIVATE vortyx_distributed)
+    add_test(NAME DistributedOrchestratorTest COMMAND test_distributed_orchestrator)
+
+    add_executable(test_distributed_contract test_distributed_contract.cpp)
+    target_link_libraries(test_distributed_contract PRIVATE vortyx_distributed)
+    add_test(NAME DistributedContractTest COMMAND test_distributed_contract)
+endif()

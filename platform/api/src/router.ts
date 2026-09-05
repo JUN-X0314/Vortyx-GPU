@@ -18,6 +18,8 @@
 // (contract.ts httpStatus + storeErrorCode) — one vocabulary everywhere.
 
 import type { AuthContext, TokenVerifier } from "./auth.ts";
+import type { IDistributedStore } from "./distributed.ts";
+import { InMemoryDistributedStore } from "./distributed.ts";
 import type { IPlatformStore } from "./store.ts";
 import type { PlatformStatus } from "./types.ts";
 import {
@@ -28,9 +30,13 @@ import {
   ERR_NOT_FOUND,
   ERR_UNAUTHENTICATED,
   httpStatus,
+  parseCreateDistributedJob,
   parseCreateJob,
   parseRegisterDevice,
+  serializeClusterView,
   serializeDevice,
+  serializeDistributedJob,
+  serializeDistributedShards,
   serializeJob,
   platformInfo,
   storeErrorCode,
@@ -59,6 +65,13 @@ export interface PlatformDeps {
   softwareVersion: string;
   /** Present only to report configuration readiness in /api/health. */
   configError?: string | null;
+  /**
+   * The Phase 12 distributed record store (cluster/job metadata). When a
+   * caller omits it, the router lazily creates an in-memory instance —
+   * the documented local/mock behavior; production deployments inject
+   * their configured implementation.
+   */
+  distributed?: IDistributedStore;
 }
 
 interface Failure {
@@ -174,6 +187,10 @@ async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<F
 
   // ---- 4. request validation + 5. store operation ------------------------
 
+  // The Phase 12 distributed surface (lazy local/mock store when the
+  // caller supplied none — see PlatformDeps.distributed).
+  const distributed = deps.distributed ?? (deps.distributed = new InMemoryDistributedStore());
+
   switch (target.kind) {
     case "register": {
       const parsed = parseBody(request.body);
@@ -228,6 +245,51 @@ async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<F
       const result = await deps.store.cancelJob(auth, target.id);
       return storeRespond(result, (record) => serializeJob(record));
     }
+
+    // ---- Phase 12: the distributed surface --------------------------------
+
+    case "cluster_view": {
+      const result = await distributed.clusterView(auth);
+      return storeRespond(result, (view) => serializeClusterView(view));
+    }
+
+    case "create_distributed_job": {
+      const parsed = parseBody(request.body);
+      if (!parsed.ok) return malformedBody();
+      const parsedJob = parseCreateDistributedJob(parsed.value);
+      if (!parsedJob.ok) {
+        return {
+          status: httpStatus("invalid_input", parsedJob.code),
+          body: errorBody(parsedJob.code, parsedJob.message),
+        };
+      }
+      const result = await distributed.createDistributedJob(auth, parsedJob.value);
+      return storeRespond(result, (record) => serializeDistributedJob(record), {
+        created: true,
+      });
+    }
+
+    case "distributed_jobs_list": {
+      const result = await distributed.distributedJobs(auth);
+      return storeRespond(result, (records) => ({
+        jobs: records.map(serializeDistributedJob),
+      }));
+    }
+
+    case "distributed_job_detail": {
+      const result = await distributed.distributedJob(auth, target.id);
+      return storeRespond(result, (record) => serializeDistributedJob(record));
+    }
+
+    case "distributed_job_shards": {
+      const result = await distributed.distributedJob(auth, target.id);
+      return storeRespond(result, (record) => serializeDistributedShards(record));
+    }
+
+    case "cancel_distributed_job": {
+      const result = await distributed.cancelDistributedJob(auth, target.id);
+      return storeRespond(result, (record) => serializeDistributedJob(record));
+    }
   }
 }
 
@@ -251,6 +313,12 @@ type Target =
   | { kind: "jobs_list" }
   | { kind: "job_detail"; id: string }
   | { kind: "cancel_job"; id: string }
+  | { kind: "cluster_view" }
+  | { kind: "create_distributed_job" }
+  | { kind: "distributed_jobs_list" }
+  | { kind: "distributed_job_detail"; id: string }
+  | { kind: "distributed_job_shards"; id: string }
+  | { kind: "cancel_distributed_job"; id: string }
   | { kind: "not_found" }
   | { kind: "method_not_allowed" };
 
@@ -264,6 +332,14 @@ function resolveTarget(method: string, path: string): Target {
       if (method === "POST") return { kind: "create_job" };
       if (method === "GET") return { kind: "jobs_list" };
       return { kind: "method_not_allowed" };
+    // Phase 12: the distributed surface (resolved before the dynamic
+    // matchers below so /api/distributed/... can never collide with them).
+    case "/api/cluster":
+      return method === "GET" ? { kind: "cluster_view" } : { kind: "method_not_allowed" };
+    case "/api/distributed/jobs":
+      if (method === "POST") return { kind: "create_distributed_job" };
+      if (method === "GET") return { kind: "distributed_jobs_list" };
+      return { kind: "method_not_allowed" };
     default:
       break;
   }
@@ -271,6 +347,27 @@ function resolveTarget(method: string, path: string): Target {
   // Dynamic segments. Ids are charset-restricted; a segment outside the
   // charset can never name a real resource -> not_found (no decoding, no
   // exception path).
+  const distributedShards = matchDistributedShards(path);
+  if (distributedShards !== null) {
+    if (method !== "GET") return { kind: "method_not_allowed" };
+    return isValidId(distributedShards)
+      ? { kind: "distributed_job_shards", id: distributedShards }
+      : { kind: "not_found" };
+  }
+  const distributedCancel = matchDistributedCancel(path);
+  if (distributedCancel !== null) {
+    if (method !== "POST") return { kind: "method_not_allowed" };
+    return isValidId(distributedCancel)
+      ? { kind: "cancel_distributed_job", id: distributedCancel }
+      : { kind: "not_found" };
+  }
+  const distributedJob = matchDistributedJobId(path);
+  if (distributedJob !== null) {
+    if (method !== "GET") return { kind: "method_not_allowed" };
+    return isValidId(distributedJob)
+      ? { kind: "distributed_job_detail", id: distributedJob }
+      : { kind: "not_found" };
+  }
   const heartbeat = matchHeartbeat(path);
   if (heartbeat !== null) {
     if (method !== "PATCH") return { kind: "method_not_allowed" };
@@ -287,6 +384,21 @@ function resolveTarget(method: string, path: string): Target {
     return isValidId(jobId) ? { kind: "job_detail", id: jobId } : { kind: "not_found" };
   }
   return { kind: "not_found" };
+}
+
+function matchDistributedShards(path: string): string | null {
+  const match = /^\/api\/distributed\/jobs\/([^/]+)\/shards$/.exec(path);
+  return match === null ? null : match[1];
+}
+
+function matchDistributedCancel(path: string): string | null {
+  const match = /^\/api\/distributed\/jobs\/([^/]+)\/cancel$/.exec(path);
+  return match === null ? null : match[1];
+}
+
+function matchDistributedJobId(path: string): string | null {
+  const match = /^\/api\/distributed\/jobs\/([^/]+)$/.exec(path);
+  return match === null ? null : match[1];
 }
 
 function matchHeartbeat(path: string): string | null {

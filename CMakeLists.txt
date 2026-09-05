@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.11.0
+    VERSION 0.12.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -16,6 +16,12 @@ option(VORTYX_ENABLE_VULKAN "Enable the Vulkan GPU compute backend (requires Vul
 # no cloud SDK, no HTTP client, no JSON dependency. OFF builds the project
 # exactly like every release before Phase 11 (the core never depends on it).
 option(VORTYX_ENABLE_PLATFORM "Build the Vortyx platform (control-plane) layer" ON)
+# Phase 12: the distributed (multi-device) layer. Builds ON TOP of the
+# platform layer (identity, auth, job contract, the provider-neutral
+# store) and adds the device registry, scheduling policies, sharding,
+# workers and the local multi-device simulator. OFF — or PLATFORM=OFF,
+# which disables it automatically — reproduces the Phase 11 build exactly.
+option(VORTYX_ENABLE_DISTRIBUTED "Build the Vortyx distributed (multi-device) layer" ON)
 
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
@@ -103,6 +109,60 @@ if(VORTYX_ENABLE_PLATFORM)
         src/platform/memory_store.cpp    # InMemoryPlatformStore (local/mock)
     )
     target_link_libraries(vortyx_platform PUBLIC vortyx_core)
+endif()
+
+# Distributed (multi-device) layer (Phase 12).
+# A SEPARATE static library, layered ON TOP of vortyx_platform: the build
+# graph enforces the direction (distributed -> platform -> core; the core
+# never sees any of it). Provider-neutral by construction: no network
+# code, no cloud SDK — the transport is an interface with an in-process
+# loopback implementation, and the platform integration speaks only
+# IPlatformStore. When the platform layer is OFF, this layer is OFF with
+# it and the build is exactly Phase 11's.
+if(VORTYX_ENABLE_DISTRIBUTED)
+    if(NOT VORTYX_ENABLE_PLATFORM)
+        message(STATUS "Vortyx: VORTYX_ENABLE_PLATFORM is OFF - the distributed layer is disabled with it")
+        set(VORTYX_ENABLE_DISTRIBUTED OFF)
+    else()
+        add_library(vortyx_distributed STATIC
+            # foundations
+            src/distributed/clock.cpp                 # injectable time (determinism)
+            src/distributed/resource.cpp              # ResourceVector invariants
+            src/distributed/device.cpp                # device state machine + capabilities
+            src/distributed/lease.cpp                 # lease guard (RAII)
+            src/distributed/registry.cpp              # IDeviceRegistry + LocalDeviceRegistry
+            src/distributed/cluster.cpp               # immutable snapshots + topology view
+            src/distributed/heartbeat.cpp             # liveness judgments (clock-injected)
+            # job machinery
+            src/distributed/shard.cpp                 # WorkPartition + shard state machine
+            src/distributed/job.cpp                   # job status derivation/mapping
+            src/distributed/retry.cpp                 # FailureCode + RetryPolicy
+            src/distributed/aggregator.cpp            # duplicate-safe aggregation
+            # scheduling
+            src/distributed/policy.cpp                # RoundRobin / LeastLoaded / CapabilityFit
+            # execution
+            src/distributed/worker.cpp                # LocalWorker -> existing Runtime
+            src/distributed/transport.cpp             # IWorkerTransport + loopback
+            src/distributed/orchestrator.cpp          # the whole flow
+            # environment
+            src/distributed/config.cpp                # VORTYX_DISTRIBUTED_* parsing
+            src/distributed/simulator.cpp             # local multi-device rig
+            src/distributed/debug.cpp                 # deterministic diagnostic dumps
+            src/distributed/contract_distributed.cpp  # distributed wire contract (C++ side)
+        )
+        target_link_libraries(vortyx_distributed PUBLIC vortyx_platform)
+
+        # Diagnostic tool (Phase 12): builds a local multi-device cluster,
+        # runs a distributed job end to end through the REAL path (registry
+        # -> placement -> lease -> workers -> runtime -> aggregation), and
+        # prints the cluster/job state. Developer visibility for the
+        # distributed layer — deliberately NOT a CTest test.
+        add_executable(vortyx_cluster
+            src/cluster_main.cpp
+        )
+        target_link_libraries(vortyx_cluster PRIVATE vortyx_distributed)
+        target_compile_definitions(vortyx_cluster PRIVATE VORTYX_BUILD_CONFIG="$<CONFIG>")
+    endif()
 endif()
 
 # GPU discovery on Windows uses DXGI (part of the Windows OS/SDK, no external

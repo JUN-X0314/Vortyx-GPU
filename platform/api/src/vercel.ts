@@ -86,4 +86,4 @@ export function createApiHandler(): (req: ApiRequestLike, res: ApiResponseLike) 
 // The API reports the Vortyx version it was built from. Single source of
 // truth on the C++ side is src/core/version.hpp; this constant mirrors it
 // for the /api/platform/info payload (checked consistent in docs).
-const SOFTWARE_VERSION = "0.11.0";
+const SOFTWARE_VERSION = "0.12.0";
