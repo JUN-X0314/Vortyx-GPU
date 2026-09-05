@@ -91,6 +91,11 @@ using vortyx::compute::Status;
 using vortyx::compute::ComputeResult;
 using vortyx::compute::VectorAddResult;
 using vortyx::compute::VectorAddTask;
+// Phase 10 (Compute Engine): the generic task/result/batch vocabulary of
+// the engine layer, surfaced through the same using-declaration pattern.
+using vortyx::compute::ComputeTask;
+using vortyx::compute::ComputeTaskResult;
+using vortyx::compute::BatchResult;
 
 // ---------------------------------------------------------------------------
 // Lifecycle state
@@ -216,6 +221,22 @@ public:
     // unavailable backends with Status::BackendUnavailable; uninitialized
     // and shut-down Virtual GPUs fail with Status::NotInitialized.
     VectorAddResult execute(const VectorAddTask& task);
+
+    // Generic compute task execution (Phase 10 — Compute Engine): any
+    // ComputeOp the engine supports, on the ONE backend this Virtual GPU
+    // was configured for. Same lifecycle gating and honesty rules as
+    // execute(VectorAddTask): no automatic backend choice, no silent
+    // fallback — an unavailable backend fails the task with its real reason.
+    ComputeTaskResult execute(const ComputeTask& task);
+
+    // Batch execution (Phase 10, synchronous — NOT the TaskQueue): every
+    // task runs on this Virtual GPU's configured backend, in submission
+    // order, and the call returns one result per task. Partial success is
+    // honest: an invalid or failed task becomes its own failed item and
+    // never discards the results of the tasks that succeeded. The call is
+    // synchronous — it holds no worker; concurrent shutdown() is forbidden
+    // by the threading contract, exactly as for a single execute().
+    BatchResult execute_batch(const std::vector<ComputeTask>& tasks);
 
     // Resource-based execution (Phase 4 style) through this Virtual GPU:
     // vector addition over three Buffer resources. All three buffers must

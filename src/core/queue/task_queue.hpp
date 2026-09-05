@@ -91,6 +91,9 @@ namespace vortyx::queue {
 using vortyx::compute::Status;
 using vortyx::compute::VectorAddResult;
 using vortyx::compute::VectorAddTask;
+// Phase 10 (Compute Engine): the generic task vocabulary for the new
+// built-in queued work item.
+using vortyx::compute::ComputeTask;
 
 // ---------------------------------------------------------------------------
 // Task identity
@@ -189,6 +192,27 @@ public:
 
 private:
     VectorAddTask task_;
+};
+
+// Phase 10 built-in work item: any generic ComputeTask (VectorAdd /
+// VectorMultiply / VectorScale) executed through the bound Virtual GPU's
+// Compute Engine path. Runs on the queue's single worker exactly like
+// VectorAddQueuedTask; the only difference is the workload description.
+//
+// Result note: the queue's result vocabulary is VectorAddResult (Phase 6
+// API, unchanged); the engine's ComputeTaskResult has the identical shape
+// today (status + error + int32 data), and this wrapper records it as such.
+// A future task kind whose result payload genuinely differs will need the
+// queue's result type to evolve — that is an explicit future seam, not
+// something this phase fakes.
+class ComputeTaskQueuedTask final : public QueuedTask {
+public:
+    explicit ComputeTaskQueuedTask(ComputeTask task);
+
+    VectorAddResult execute(vortyx::vgpu::VirtualGpu& gpu) override;
+
+private:
+    ComputeTask task_;
 };
 
 // ---------------------------------------------------------------------------

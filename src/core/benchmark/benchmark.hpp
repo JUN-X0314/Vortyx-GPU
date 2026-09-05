@@ -112,16 +112,23 @@ namespace vortyx::benchmark {
 using vortyx::compute::Status;
 using vortyx::compute::VectorAddResult;
 using vortyx::compute::VectorAddTask;
+// Phase 10 (Compute Engine): the generic task vocabulary for the generic
+// benchmark entry point.
+using vortyx::compute::ComputeTask;
+using vortyx::compute::ComputeTaskResult;
+using vortyx::compute::ComputeOp;
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-// What and how often to measure. The WORKLOAD is the caller's VectorAddTask
-// (its element count is the workload size — construct the task with the size
-// you want measured); the config only controls the measurement repetition.
-// There is deliberately no "workload size" field here that could disagree
-// with the actual task.
+// What and how often to measure. The WORKLOAD is the caller's task (its
+// element count is the workload size — construct the task with the size you
+// want measured); the config only controls the measurement repetition. There
+// is deliberately no "workload size" field here that could disagree with the
+// actual task. Phase 10 accepts any generic ComputeTask (see
+// benchmark_compute); benchmark_vector_add remains the unchanged Phase 8
+// entry point for VectorAddTask workloads.
 struct BenchmarkConfig {
     // Measured iterations. Every iteration is a real execute() timed with
     // steady_clock and verified for correctness. Must be > 0 (a benchmark
@@ -197,14 +204,21 @@ bool compute_timing_stats(const std::vector<std::chrono::nanoseconds>& samples,
 // for humans and to_key_values() exports a stable key=value schema for
 // tooling — no unit-less numbers anywhere.
 //
-// Fields 'backend' / 'device' / 'element_count' / 'warmup_iterations' /
-// 'iterations' describe WHAT was measured (always filled, even on failure —
-// they are known before the first timed call). The timing statistics and
-// 'correctness_verified' are meaningful only when status == Status::Ok; on
-// failure they stay zero/false and 'error' explains why.
+// Fields 'workload' / 'backend' / 'device' / 'element_count' /
+// 'warmup_iterations' / 'iterations' describe WHAT was measured (always
+// filled, even on failure — they are known before the first timed call). The
+// timing statistics and 'correctness_verified' are meaningful only when
+// status == Status::Ok; on failure they stay zero/false and 'error' explains
+// why.
 struct BenchmarkResult {
     Status status = Status::Ok;
     std::string error;  // empty when status == Ok
+
+    // WHAT was measured: the stable workload label of the operation
+    // ("vector_add", "vector_multiply", "vector_scale" — see
+    // compute::workload_label). Phase 8 runs all said "vector_add"; the key
+    // set of the exporter is unchanged, only the label can differ now.
+    std::string workload = "vector_add";
 
     // The measured execution target: exactly the configured backend of the
     // Virtual GPU the benchmark was given (a backend name, e.g. "cpu" or
@@ -217,8 +231,8 @@ struct BenchmarkResult {
     // when the backend cannot report a device (e.g. unavailable Vulkan).
     vortyx::device::DeviceInfo device;
 
-    // Workload size: element count of the measured task (C[i] = A[i]+B[i]
-    // over int32).
+    // Workload size: element count of the measured task. For every current
+    // op one element is one int32 element processed end to end.
     std::size_t element_count = 0;
 
     // Warmup iterations requested (executed first, excluded from stats).
@@ -234,8 +248,9 @@ struct BenchmarkResult {
     TimingStats timing{};
 
     // True only when status == Ok AND every executed iteration (warmup and
-    // measured) produced bit-exact C == A + B. A run that never verified
-    // (it failed earlier) reports false — verification is never assumed.
+    // measured) produced bit-exact expected output. A run that never
+    // verified (it failed earlier) reports false — verification is never
+    // assumed.
     bool correctness_verified = false;
 };
 
@@ -243,9 +258,11 @@ struct BenchmarkResult {
 // The benchmark itself
 // ---------------------------------------------------------------------------
 
-// Benchmarks one VectorAddTask on the given, caller-owned Virtual GPU by
+// Benchmarks ONE VectorAddTask on the given, caller-owned Virtual GPU by
 // executing the REAL path (Virtual GPU -> Runtime -> Resource Manager ->
-// Backend) 'config.warmup_iterations + config.iterations' times.
+// Backend) 'config.warmup_iterations + config.iterations' times. This is the
+// unchanged Phase 8 entry point; it adapts the task into the generic engine
+// and measures the same single path benchmark_compute() measures.
 //
 // Sequence:
 //   1. Validate the config (iterations > 0) and the task
@@ -269,6 +286,26 @@ struct BenchmarkResult {
 BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
                                      const VectorAddTask& task,
                                      const BenchmarkConfig& config);
+
+// Generic benchmark (Phase 10): the same measurement discipline as
+// benchmark_vector_add, for any ComputeOp the engine supports (VectorAdd /
+// VectorMultiply / VectorScale).
+//   - STILL measures ONLY the real VirtualGpu::execute() path: the module
+//     contains no compute kernel of its own. The host-side reference below
+//     is verification, never a timed or reported computation.
+//   - Workload label: the operation's stable label ("vector_multiply", ...)
+//     in the result and exporter — comparisons across DIFFERENT operations
+//     stay semantically labeled, never collapsed into one number.
+//   - Throughput definition (unchanged semantics): element_count /
+//     average_ns — one element is one int32 element processed end to end
+//     for every current op, so the number means the same thing per op.
+//   - Correctness: every iteration (warmup AND measured) is verified
+//     against the op's host-computed reference outside the timed window;
+//     a wrong iteration fails the whole benchmark. Integer results are
+//     bit-exact, so the verdict is exact, not tolerance-based.
+BenchmarkResult benchmark_compute(vortyx::vgpu::VirtualGpu& gpu,
+                                  const ComputeTask& task,
+                                  const BenchmarkConfig& config);
 
 // ---------------------------------------------------------------------------
 // Output forms

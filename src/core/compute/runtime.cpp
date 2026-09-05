@@ -139,7 +139,24 @@ VectorAddResult Runtime::execute(const VectorAddTask& task) {
 }
 
 VectorAddResult Runtime::execute(const VectorAddTask& task, const std::string& backend_name) {
-    VectorAddResult result;
+    // Phase 10: the legacy Phase 3/4 API is the VectorAdd specialization of
+    // the generic compute engine. Adapting and delegating keeps validation,
+    // task->buffer translation, dispatch and error reporting in exactly ONE
+    // place, so the legacy API and the generic engine cannot drift apart.
+    ComputeTask generic;
+    generic.op = ComputeOp::VectorAdd;
+    generic.a = task.a;
+    generic.b = task.b;
+    const ComputeTaskResult result = execute(generic, backend_name);
+    return VectorAddResult{result.status, std::move(result.error), std::move(result.data)};
+}
+
+ComputeTaskResult Runtime::execute(const ComputeTask& task) {
+    return execute(task, "cpu");
+}
+
+ComputeTaskResult Runtime::execute(const ComputeTask& task, const std::string& backend_name) {
+    ComputeTaskResult result;
 
     if (!initialized_) {
         result.status = Status::NotInitialized;
@@ -161,26 +178,28 @@ VectorAddResult Runtime::execute(const VectorAddTask& task, const std::string& b
         return result;
     }
 
-    const Status validation = validate_vector_add(task);
+    // Strict task validation before anything executes (same policy as the
+    // legacy path: an invalid task never reaches a backend).
+    std::string validation_error;
+    const Status validation = validate_compute_task(task, validation_error);
     if (validation != Status::Ok) {
         result.status = validation;
-        result.error = "invalid vector addition task (a.size=" +
-                       std::to_string(task.a.size()) + ", b.size=" +
-                       std::to_string(task.b.size()) + "); arrays must be non-empty and equal size";
+        result.error = validation_error;
         return result;
     }
 
-    // Phase 4: the task's inputs/outputs are expressed as Buffer resources on
-    // the requested backend. RAII guarantees they are released on EVERY path
-    // below, so no scratch memory (host or GPU) ever leaks.
+    // Translate the task into Buffer resources on the requested backend
+    // (allocate -> upload -> dispatch -> download -> release). RAII
+    // guarantees they are released on EVERY path below, so no scratch
+    // memory (host or GPU) ever leaks.
     const std::size_t count = task.a.size();
     const std::size_t bytes = count * sizeof(std::int32_t);
+    const bool two_input = (task.op != ComputeOp::VectorScale);
 
     const vortyx::resource::BufferDesc desc_a =
         vortyx::resource::BufferDesc::of<std::int32_t>(count, vortyx::resource::ResourceAccess::Read);
-    const vortyx::resource::BufferDesc desc_b = desc_a;
-    const vortyx::resource::BufferDesc desc_c =
-        vortyx::resource::BufferDesc::of<std::int32_t>(count, vortyx::resource::ResourceAccess::Write);
+    const vortyx::resource::BufferDesc desc_c = vortyx::resource::BufferDesc::of<std::int32_t>(
+        count, vortyx::resource::ResourceAccess::Write);
 
     vortyx::resource::BufferResult ra = resources_->create_buffer(desc_a, backend_name);
     if (ra.status != Status::Ok) {
@@ -189,12 +208,15 @@ VectorAddResult Runtime::execute(const VectorAddTask& task, const std::string& b
                        "': " + ra.error;
         return result;
     }
-    vortyx::resource::BufferResult rb = resources_->create_buffer(desc_b, backend_name);
-    if (rb.status != Status::Ok) {
-        result.status = Status::BackendError;
-        result.error = "failed to allocate input buffer B on backend '" + backend_name +
-                       "': " + rb.error;
-        return result;
+    vortyx::resource::BufferResult rb;
+    if (two_input) {
+        rb = resources_->create_buffer(desc_a, backend_name);
+        if (rb.status != Status::Ok) {
+            result.status = Status::BackendError;
+            result.error = "failed to allocate input buffer B on backend '" + backend_name +
+                           "': " + rb.error;
+            return result;
+        }
     }
     vortyx::resource::BufferResult rc = resources_->create_buffer(desc_c, backend_name);
     if (rc.status != Status::Ok) {
@@ -204,24 +226,32 @@ VectorAddResult Runtime::execute(const VectorAddTask& task, const std::string& b
         return result;
     }
 
-    // Upload the inputs into the resources.
+    // Upload the input(s) into the resources.
     const ComputeResult wa = ra.buffer.write(task.a.data(), bytes);
     if (wa.status != Status::Ok) {
         result.status = Status::BackendError;
         result.error = "failed to upload input buffer A: " + wa.error;
         return result;
     }
-    const ComputeResult wb = rb.buffer.write(task.b.data(), bytes);
-    if (wb.status != Status::Ok) {
-        result.status = Status::BackendError;
-        result.error = "failed to upload input buffer B: " + wb.error;
-        return result;
+    if (two_input) {
+        const ComputeResult wb = rb.buffer.write(task.b.data(), bytes);
+        if (wb.status != Status::Ok) {
+            result.status = Status::BackendError;
+            result.error = "failed to upload input buffer B: " + wb.error;
+            return result;
+        }
     }
 
-    // Execute directly on the buffers.
-    const ComputeResult exec = backend->execute(*resources_->resource(ra.buffer.id()),
-                                                *resources_->resource(rb.buffer.id()),
-                                                *resources_->resource(rc.buffer.id()));
+    // Dispatch through the ONE buffer-level compute shape. The buffers were
+    // created through THIS manager above, so the resolved pointers are the
+    // resources this execution owns (foreign handles cannot enter here).
+    ComputeDispatch dispatch;
+    dispatch.op = task.op;
+    dispatch.scalar = task.scalar;
+    dispatch.input_a = resources_->resource(ra.buffer.id());
+    dispatch.input_b = two_input ? resources_->resource(rb.buffer.id()) : nullptr;
+    dispatch.output = resources_->resource(rc.buffer.id());
+    const ComputeResult exec = backend->execute(dispatch);
     if (exec.status != Status::Ok) {
         result.status = exec.status;
         result.error = exec.error;
@@ -240,6 +270,67 @@ VectorAddResult Runtime::execute(const VectorAddTask& task, const std::string& b
     result.status = Status::Ok;
     result.error.clear();
     return result;
+}
+
+BatchResult Runtime::execute_batch(const std::vector<ComputeTask>& tasks,
+                                   const std::string& backend_name) {
+    BatchResult batch;
+
+    // Wholesale refusals happen BEFORE any task runs; their reason is the
+    // batch's own status/error and 'results' stays empty.
+    if (!initialized_) {
+        batch.status = Status::NotInitialized;
+        batch.error = "Runtime is not initialized (call initialize() before execute_batch())";
+        return batch;
+    }
+    IComputeBackend* backend = find_backend(backend_name);
+    if (backend == nullptr) {
+        batch.status = Status::BackendUnavailable;
+        batch.error = "backend '" + backend_name + "' is not supported; " +
+                      backend_unavailable_reason(backend_name);
+        return batch;
+    }
+    if (!backend->available()) {
+        batch.status = Status::BackendUnavailable;
+        batch.error = "backend '" + backend_name + "' is unavailable on this system: " +
+                      backend->unavailable_reason();
+        return batch;
+    }
+    if (tasks.empty()) {
+        batch.status = Status::InvalidInput;
+        batch.error = "batch execution called with zero tasks (an empty batch has "
+                      "nothing to execute)";
+        return batch;
+    }
+
+    // Every task is attempted, in submission order. Invalid tasks fail as
+    // their own item (without executing); earlier failures never stop later
+    // tasks; successful results are never discarded.
+    batch.results.resize(tasks.size());
+    bool any_failed = false;
+    std::size_t first_failure = 0;
+    for (std::size_t i = 0; i < tasks.size(); ++i) {
+        batch.results[i] = execute(tasks[i], backend_name);
+        if (batch.results[i].status == Status::Ok) {
+            ++batch.succeeded;
+        } else {
+            ++batch.failed;
+            if (!any_failed) {
+                any_failed = true;
+                first_failure = i;
+            }
+        }
+    }
+
+    if (any_failed) {
+        // Honest aggregate: the FIRST failing item's own status (no new
+        // status vocabulary), with counts and the first failure's reason.
+        batch.status = batch.results[first_failure].status;
+        batch.error = "batch finished with " + std::to_string(batch.failed) + " of " +
+                      std::to_string(tasks.size()) + " task(s) failed; first failure at index " +
+                      std::to_string(first_failure) + ": " + batch.results[first_failure].error;
+    }
+    return batch;
 }
 
 ComputeResult Runtime::execute(const vortyx::resource::Buffer& a,

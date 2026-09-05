@@ -24,9 +24,22 @@
 //     interface (task->buffer translation now lives once in the Runtime).
 //     The public Runtime::execute(VectorAddTask) API is unchanged.
 //
-// SPIR-V for the kernel is pre-compiled and embedded
-// (src/core/compute/vector_add_spv.hpp); no shader compilation or download
-// happens at runtime.
+// Phase 10 change — generic elementwise dispatch:
+//   - ONE compute pipeline per ComputeOp (vector_add / vector_multiply /
+//     vector_scale), sharing ONE descriptor set layout, pool and set. Each
+//     embedded SPIR-V kernel implements exactly one operation; kernels share
+//     a common push-constant block { uint count; int scalar; }.
+//   - The Phase 4 execute(a, b, c) signature is unchanged and routes through
+//     the generic dispatch as its VectorAdd specialization.
+//   - VectorScale dispatches with input_b == null; the primary input's
+//     buffer is aliased into the unused read-only descriptor slot 1 that
+//     the scale kernel never reads (documented in the shader source). No
+//     dummy buffer is allocated.
+//
+// SPIR-V for the kernels is pre-compiled and embedded
+// (src/core/compute/vector_add_spv.hpp, vector_multiply_spv.hpp,
+// vector_scale_spv.hpp); no shader compilation or download happens at
+// runtime.
 //
 // All Vulkan state lives in an opaque Impl (PIMPL) owned by this class and
 // destroyed by shutdown(), so GPU resources can never leak past the
@@ -55,10 +68,17 @@ public:
     // Buffer-based execution: a, b, c must be VulkanBuffer resources allocated
     // on THIS backend's device. Binds them to the descriptor set and dispatches
     // the compute kernel; results are left inside c (the caller downloads with
-    // c's read()).
+    // c's read()). Phase 10: the VectorAdd specialization of the generic
+    // dispatch below — the binding/dispatch code exists exactly once.
     ComputeResult execute(const vortyx::resource::IBufferImpl& a,
                           const vortyx::resource::IBufferImpl& b,
                           vortyx::resource::IBufferImpl& c) override;
+
+    // Generic dispatch (Phase 10): executes the operation named by
+    // 'dispatch' on this backend's device, through the per-op compute
+    // pipeline. Same ownership/validation/no-throw rules as the Phase 4
+    // contract, generalized to the op.
+    ComputeResult execute(const ComputeDispatch& dispatch) override;
 
     // The backend's buffer provider (allocates real VkBuffer + VkDeviceMemory).
     // Non-null only while the backend is initialized.

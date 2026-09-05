@@ -38,6 +38,7 @@
 using vortyx::benchmark::BenchmarkConfig;
 using vortyx::benchmark::BenchmarkResult;
 using vortyx::benchmark::TimingStats;
+using vortyx::benchmark::benchmark_compute;
 using vortyx::benchmark::benchmark_vector_add;
 using vortyx::benchmark::compute_timing_stats;
 using vortyx::benchmark::describe;
@@ -344,6 +345,81 @@ int main() {
         queue.shutdown();
         queue_gpu.shutdown();
         bench_gpu.shutdown();
+    }
+
+    // =====================================================================
+    // 7. Generic benchmark (Phase 10): the same measurement discipline for
+    //    every ComputeOp. Still the REAL execute() path, per-iteration
+    //    correctness, op-labeled workload, unchanged statistics semantics.
+    // =====================================================================
+    {
+        VirtualGpu gpu;
+        check(gpu.initialize() == Status::Ok, "7: CPU Virtual GPU initializes");
+
+        // 7a. A multiply benchmark: full invariants + op label.
+        vortyx::compute::ComputeTask mul;
+        mul.op = vortyx::compute::ComputeOp::VectorMultiply;
+        mul.a.resize(512);
+        mul.b.resize(512);
+        for (std::size_t i = 0; i < 512; ++i) {
+            mul.a[i] = static_cast<std::int32_t>(i % 400) - 200;
+            mul.b[i] = static_cast<std::int32_t>((i * 3) % 250) - 100;
+        }
+        BenchmarkConfig config;
+        config.iterations = 6;
+        config.warmup_iterations = 1;
+        const BenchmarkResult mul_result = benchmark_compute(gpu, mul, config);
+        check(mul_result.status == Status::Ok, "7a: multiply benchmark succeeds");
+        check(mul_result.workload == "vector_multiply",
+              "7a: workload label names the operation");
+        check(mul_result.backend == "cpu" && mul_result.element_count == 512 &&
+                  mul_result.iterations == 6 && mul_result.correctness_verified,
+              "7a: structural fields describe what was measured");
+        check(mul_result.timing.max >= mul_result.timing.min &&
+                  mul_result.timing.max.count() > 0,
+              "7a: timing invariants hold (structural, never specific values)");
+        {
+            bool has_workload = false;
+            for (const auto& pair : to_key_values(mul_result)) {
+                if (pair.first == "workload" && pair.second == "vector_multiply")
+                    has_workload = true;
+            }
+            check(has_workload, "7a: export carries the op-labeled workload key");
+        }
+
+        // 7b. A scale benchmark: the same discipline for a one-input op.
+        vortyx::compute::ComputeTask scale;
+        scale.op = vortyx::compute::ComputeOp::VectorScale;
+        scale.a = {3, -3, 100, 0};
+        scale.scalar = -5;
+        const BenchmarkResult scale_result = benchmark_compute(gpu, scale, BenchmarkConfig{});
+        check(scale_result.status == Status::Ok &&
+                  scale_result.workload == "vector_scale" &&
+                  scale_result.correctness_verified,
+              "7b: scale benchmark succeeds with its own label");
+
+        // 7c. Generic-path refusals stay honest (nothing executes).
+        BenchmarkConfig zero_iterations;
+        zero_iterations.iterations = 0;
+        zero_iterations.warmup_iterations = 0;
+        BenchmarkResult r = benchmark_compute(gpu, mul, zero_iterations);
+        check(r.status == Status::InvalidInput, "7c: zero iterations refused on the generic path");
+        vortyx::compute::ComputeTask bad_scale = scale;
+        bad_scale.b = {1, 2};  // scale must not carry a second input
+        r = benchmark_compute(gpu, bad_scale, BenchmarkConfig{});
+        check(r.status == Status::InvalidInput &&
+                  r.error.find("exactly one input") != std::string::npos,
+              "7c: invalid generic task refused with the reason");
+
+        // 7d. The legacy entry point still measures the same single path.
+        const VectorAddTask legacy_task = make_task(128);
+        const BenchmarkResult legacy = benchmark_vector_add(gpu, legacy_task, BenchmarkConfig{});
+        check(legacy.status == Status::Ok && legacy.workload == "vector_add" &&
+                  legacy.correctness_verified,
+              "7d: benchmark_vector_add keeps the stable vector_add label");
+        check_success_invariants(legacy, legacy_task, 10, "cpu", "7d");
+
+        gpu.shutdown();
     }
 
     if (failures == 0) {

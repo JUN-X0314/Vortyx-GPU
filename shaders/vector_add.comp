@@ -1,14 +1,24 @@
 #version 450
 
-// Vortyx Phase 3: Vector Addition compute shader.
+// Vortyx Phase 3/10: Vector Addition compute kernel.
 // Computes C[i] = A[i] + B[i] for i in [0, count).
 //
 // One workgroup processes LOCAL_SIZE_X elements; the dispatch uses
 // ceil(count / LOCAL_SIZE_X) workgroups and this guard rejects the
 // out-of-range invocations of the last workgroup.
 //
+// Phase 10: the push-constant block is the SHARED elementwise layout used by
+// all three elementwise kernels (add / multiply / scale):
+//   count  - number of elements (uint32)
+//   scalar - operation parameter (int32); UNUSED by this kernel but part of
+//            the shared block so one pipeline layout serves every op.
+//
+// Integer semantics: int addition is exact modulo 2^32 (two's complement
+// wraparound), identical on every backend — cross-backend results are
+// bit-exact by construction.
+//
 // Regenerate SPIR-V (requires glslangValidator or glslc from the Vulkan SDK):
-//   glslangValidator -V --target-env vulkan1.0 shaders/vector_add.comp -o vector_add.spv
+//   glslangValidator -V --target-env vulkan1.0 shaders/vector_add.comp -o shaders/vector_add.spv
 // The compiled SPIR-V is embedded into the binary via
 // src/core/compute/vector_add_spv.hpp (see scripts/embed_spv.py).
 
@@ -20,6 +30,7 @@ layout(std430, binding = 2) buffer OutC { int out_c[]; };
 
 layout(push_constant) uniform PushConstants {
     uint count;  // number of elements (uint32)
+    int scalar;  // shared block; unused by the add kernel
 } pc;
 
 void main() {

@@ -1,23 +1,28 @@
-// vortyx_bench — the Phase 8 standalone benchmark tool.
+// vortyx_bench — the Phase 8/10 standalone benchmark tool.
 //
 // Measures the REAL Vortyx compute path (Virtual GPU -> Runtime ->
-// Resource Manager -> Backend) over a fixed ladder of VectorAdd workload
-// sizes, on the CPU backend always and on the Vulkan backend when a device
-// is really available on this system. Results are printed in the
-// human-readable form; the machine-readable key=value export of the same
-// real numbers follows each result.
+// Resource Manager -> Backend) over a fixed ladder of workload sizes, on
+// the CPU backend always and on the Vulkan backend when a device is really
+// available on this system. Phase 10 extends the ladder to every ComputeOp
+// the engine supports (vector_add, vector_multiply, vector_scale) — each
+// measured and verified independently, never collapsed into one number.
 //
-// Scope of every reported number (documented, identical for both backends):
-// one sample = one VirtualGpu::execute(task) call — that is allocation +
-// upload + execution + readback + release, end to end, CPU wall-clock
-// (steady_clock). The Runtime API does not expose GPU-internal execution
-// boundaries, so nothing here is labeled "GPU time". Setup (initialization,
-// input construction, reference computation) is outside the timed window.
+// Results are printed in the human-readable form; the machine-readable
+// key=value export of the same real numbers follows each result.
+//
+// Scope of every reported number (documented, identical for all backends
+// and ops): one sample = one VirtualGpu::execute(task) call — that is
+// allocation + upload + execution + readback + release, end to end, CPU
+// wall-clock (steady_clock). The Runtime API does not expose GPU-internal
+// execution boundaries, so nothing here is labeled "GPU time". Setup
+// (initialization, input construction, reference computation) is outside
+// the timed window.
 //
 // This tool is a measurement utility, not a pass/fail test: the timing
 // numbers are real measurements that vary by machine, and no output of
-// this tool should be read as a performance claim. Run the CTest suite for
-// the deterministic Phase 8 invariants instead.
+// this tool should be read as a performance claim (numbers from DIFFERENT
+// operations are labeled separately and are never compared as "better").
+// Run the CTest suite for the deterministic benchmark invariants instead.
 //
 // Exit code: 0 when every benchmark that RAN verified its correctness;
 // 1 when a benchmark failed unexpectedly. A Vulkan benchmark that cannot
@@ -42,25 +47,37 @@ namespace {
 
 using vortyx::benchmark::BenchmarkConfig;
 using vortyx::benchmark::BenchmarkResult;
+using vortyx::compute::ComputeOp;
+using vortyx::compute::ComputeTask;
 
-// Deterministic inputs over safe int32 ranges (no overflow: the task doc's
-// modular-addition note applies; a and b stay well below INT32_MAX/2).
-vortyx::compute::VectorAddTask make_task(std::size_t count) {
-    vortyx::compute::VectorAddTask task;
+// Deterministic inputs over safe int32 ranges for the two-input ops. The
+// ops use int32 modular arithmetic (bit-exact on every backend), so the
+// verification reference is exact regardless of ranges; these ranges simply
+// keep the ladder readable and far away from accidental overflow surprises.
+ComputeTask make_task(ComputeOp op, std::size_t count) {
+    ComputeTask task;
+    task.op = op;
     task.a.resize(count);
-    task.b.resize(count);
+    if (op != ComputeOp::VectorScale) {
+        task.b.resize(count);
+    }
     for (std::size_t i = 0; i < count; ++i) {
         task.a[i] = static_cast<std::int32_t>(i % 1000) - 300;
-        task.b[i] = static_cast<std::int32_t>((i * 7) % 500) + 11;
+        if (op != ComputeOp::VectorScale) {
+            task.b[i] = static_cast<std::int32_t>((i * 7) % 500) + 11;
+        }
+    }
+    if (op == ComputeOp::VectorScale) {
+        task.scalar = -7;  // fixed deterministic scale factor
     }
     return task;
 }
 
 // The measurement ladder. Small enough to keep the tool quick even on the
-// largest size (1M elements = 4 MiB per input, 3 live buffers ~ 12 MiB —
-// far below the Phase 4 per-buffer safety cap of 1 GiB), large enough to
-// make per-iteration cost visible above noise. Iterations are modest for
-// the same reason; raise them locally when you want tighter statistics.
+// largest size (1M elements = 4 MiB per input, ~3 live buffers — far below
+// the Phase 4 per-buffer safety cap of 1 GiB), large enough to make
+// per-iteration cost visible above noise. Iterations are modest for the
+// same reason; raise them locally when you want tighter statistics.
 struct LadderStep {
     std::size_t element_count;
     std::uint32_t iterations;
@@ -73,8 +90,15 @@ const LadderStep kLadder[] = {
     {1024 * 1024, 10},
 };
 
-// Runs the ladder on one backend. Returns true when every benchmark that
-// ran verified correctness; reports skips and failures honestly.
+const ComputeOp kOps[] = {
+    ComputeOp::VectorAdd,
+    ComputeOp::VectorMultiply,
+    ComputeOp::VectorScale,
+};
+
+// Runs the whole ladder (every op x every size) on one backend. Returns
+// true when every benchmark that ran verified correctness; reports skips
+// and failures honestly.
 bool run_ladder(const std::string& backend) {
     vortyx::vgpu::VirtualGpuDesc desc;
     desc.backend = backend;
@@ -101,22 +125,24 @@ bool run_ladder(const std::string& backend) {
               << "\n";
 
     bool all_ok = true;
-    for (const LadderStep& step : kLadder) {
-        const vortyx::compute::VectorAddTask task = make_task(step.element_count);
-        BenchmarkConfig config;
-        config.iterations = step.iterations;
-        config.warmup_iterations = 2;
+    for (const ComputeOp op : kOps) {
+        for (const LadderStep& step : kLadder) {
+            const ComputeTask task = make_task(op, step.element_count);
+            BenchmarkConfig config;
+            config.iterations = step.iterations;
+            config.warmup_iterations = 2;
 
-        const BenchmarkResult result = vortyx::benchmark::benchmark_vector_add(gpu, task, config);
+            const BenchmarkResult result = vortyx::benchmark::benchmark_compute(gpu, task, config);
 
-        std::cout << vortyx::benchmark::describe(result) << "\n";
-        for (const auto& kv : vortyx::benchmark::to_key_values(result)) {
-            std::cout << "  " << kv.first << "=" << kv.second << "\n";
-        }
+            std::cout << vortyx::benchmark::describe(result) << "\n";
+            for (const auto& kv : vortyx::benchmark::to_key_values(result)) {
+                std::cout << "  " << kv.first << "=" << kv.second << "\n";
+            }
 
-        if (result.status != vortyx::compute::Status::Ok || !result.correctness_verified) {
-            all_ok = false;
-            std::cout << "  -> FAILED (see status/error above)\n";
+            if (result.status != vortyx::compute::Status::Ok || !result.correctness_verified) {
+                all_ok = false;
+                std::cout << "  -> FAILED (see status/error above)\n";
+            }
         }
     }
 
@@ -134,7 +160,8 @@ int main() {
     std::cout << "========================================\n";
     std::cout << "Measured scope per iteration: VirtualGpu::execute(task) end to end\n"
               << "(allocation + upload + execution + readback + release), CPU wall-clock.\n"
-              << "Timings vary by machine; numbers are measurements, not claims.\n\n";
+              << "Ops are measured and labeled separately; timings vary by machine;\n"
+              << "numbers are measurements, not claims.\n\n";
 
     bool ok = true;
     ok = run_ladder("cpu") && ok;      // every system

@@ -28,6 +28,38 @@
 
 namespace vortyx::compute {
 
+// ---------------------------------------------------------------------------
+// Buffer-level dispatch (Phase 10 — Compute Engine)
+// ---------------------------------------------------------------------------
+
+// ONE explicit buffer-level compute request: which operation, its scalar
+// parameter, and the live backend-owned buffers it reads/writes. This is the
+// single dispatch shape every elementwise operation goes through — adding an
+// operation extends ComputeOp and the validation table, not the interface.
+//
+// Buffer rules (enforced by the Runtime AND defensively re-checked by every
+// backend, like the Phase 4 contract):
+//   - input_a/output must be non-null for every op; input_b must be non-null
+//     for VectorAdd/VectorMultiply and null for VectorScale.
+//   - the buffers must have been created through THIS backend's provider
+//     (foreign buffers are rejected with an error, never accessed) — the
+//     Runtime verifies ownership BEFORE resolving handles; the backend
+//     re-checks the concrete type and device identity.
+//   - shapes/access roles are validated with
+//     validate_compute_dispatch_buffers(op, ...).
+struct ComputeDispatch {
+    ComputeOp op = ComputeOp::VectorAdd;
+
+    // Operation parameter. VectorScale: the scale factor (int32). All other
+    // current ops ignore it (and their task-level validation refuses a
+    // non-zero scalar so it can never silently matter here).
+    std::int32_t scalar = 0;
+
+    const vortyx::resource::IBufferImpl* input_a = nullptr;
+    const vortyx::resource::IBufferImpl* input_b = nullptr;  // op-dependent, see above
+    vortyx::resource::IBufferImpl* output = nullptr;
+};
+
 class IComputeBackend {
 public:
     virtual ~IComputeBackend() = default;
@@ -56,9 +88,21 @@ public:
     // this backend's provider (foreign buffers are rejected with an error,
     // never accessed). Must not throw; failures are reported through
     // ComputeResult::status / error.
+    //
+    // Phase 10: this remains the exact Phase 4 vector-add contract. It is
+    // now implemented as the VectorAdd specialization of the generic
+    // dispatch below (every backend funnels it through execute(dispatch),
+    // so the compute loops/binding code exist exactly once per backend).
     virtual ComputeResult execute(const vortyx::resource::IBufferImpl& a,
                                   const vortyx::resource::IBufferImpl& b,
                                   vortyx::resource::IBufferImpl& c) = 0;
+
+    // Generic buffer-level dispatch (Phase 10): executes the operation named
+    // by 'dispatch' over the given backend-owned buffers. Same ownership,
+    // validation and no-throw rules as execute(a, b, c) above, generalized
+    // to the op in the dispatch. The output is left inside 'output' (the
+    // caller downloads it through Buffer::read).
+    virtual ComputeResult execute(const ComputeDispatch& dispatch) = 0;
 
     // The backend's buffer factory for the Resource Manager, or nullptr when
     // this backend does not provide device storage (stub build, not

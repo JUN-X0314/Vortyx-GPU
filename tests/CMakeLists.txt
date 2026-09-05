@@ -110,3 +110,19 @@ add_test(NAME MonitorTest COMMAND test_monitor)
 add_executable(test_monitor_gpu test_monitor_gpu.cpp)
 target_link_libraries(test_monitor_gpu PRIVATE vortyx_core)
 add_test(NAME MonitorGpuTest COMMAND test_monitor_gpu)
+
+# Phase 10: Compute Engine (generic ComputeTask layer).
+# - CPU tests must pass on every system (including GPU-less machines and
+#   CPU-only builds): strict validation, every op vs the host reference,
+#   modular int32 semantics, legacy/generic identity, parallel-CPU
+#   determinism, batch semantics (per-item honesty, partial success,
+#   wholesale refusals), VirtualGpu gating, TaskQueue integration.
+# - GPU tests run for real when a Vulkan device is available; on systems
+#   without one they exit with an explicit SKIP note (never a fake success).
+add_executable(test_compute_tasks test_compute_tasks.cpp)
+target_link_libraries(test_compute_tasks PRIVATE vortyx_core)
+add_test(NAME ComputeTasksTest COMMAND test_compute_tasks)
+
+add_executable(test_compute_tasks_gpu test_compute_tasks_gpu.cpp)
+target_link_libraries(test_compute_tasks_gpu PRIVATE vortyx_core)
+add_test(NAME ComputeTasksGpuTest COMMAND test_compute_tasks_gpu)

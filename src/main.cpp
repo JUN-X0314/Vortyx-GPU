@@ -145,7 +145,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   9 (Stabilization)" << std::endl;
+    std::cout << "  Phase:   10 (Compute Engine)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -664,6 +664,79 @@ int main() {
         }
     }
 
+    // =====================================================================
+    // 6. Compute Engine (Phase 10): generic ComputeTasks beyond vector
+    //    addition — elementwise int32 ops (VectorAdd / VectorMultiply /
+    //    VectorScale) with bit-exact cross-backend semantics, plus honest
+    //    synchronous BATCH execution (one result per task, partial success
+    //    allowed, failures never hidden). This is still the same execution
+    //    path: Virtual GPU -> Runtime -> Resource Manager -> Backend.
+    // =====================================================================
+    {
+        vortyx::vgpu::VirtualGpu gpu;  // explicit cpu backend
+        if (gpu.initialize() != vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Error, "CPU Virtual GPU for the Compute Engine failed to initialize.");
+            return 1;
+        }
+
+        // --- 6a. VectorMultiply: C[i] = A[i] * B[i] ----------------------
+        vortyx::compute::ComputeTask multiply;
+        multiply.op = vortyx::compute::ComputeOp::VectorMultiply;
+        multiply.a = {2, -3, 10, 7};
+        multiply.b = {5, 4, -1, 0};
+        const vortyx::compute::ComputeTaskResult mul_result = gpu.execute(multiply);
+        if (mul_result.status == vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Compute Engine (cpu) VectorMultiply success: C = A * B (" +
+                            join_values(mul_result.data, 8) + ")");
+        } else {
+            vortyx::log(vortyx::LogLevel::Error,
+                        std::string("Compute Engine VectorMultiply failed: ") +
+                            to_string(mul_result.status) + " - " + mul_result.error);
+        }
+
+        // --- 6b. VectorScale: C[i] = A[i] * scalar -----------------------
+        vortyx::compute::ComputeTask scale;
+        scale.op = vortyx::compute::ComputeOp::VectorScale;
+        scale.a = {1, -2, 3, -4};
+        scale.scalar = -7;
+        const vortyx::compute::ComputeTaskResult scale_result = gpu.execute(scale);
+        if (scale_result.status == vortyx::compute::Status::Ok) {
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Compute Engine (cpu) VectorScale success: C = A * (-7) (" +
+                            join_values(scale_result.data, 8) + ")");
+        } else {
+            vortyx::log(vortyx::LogLevel::Error,
+                        std::string("Compute Engine VectorScale failed: ") +
+                            to_string(scale_result.status) + " - " + scale_result.error);
+        }
+
+        // --- 6c. Batch execution: per-task honesty, partial success ------
+        std::vector<vortyx::compute::ComputeTask> batch_tasks;
+        batch_tasks.push_back(scale);                    // 0: valid
+        batch_tasks.push_back(multiply);                 // 1: valid
+        vortyx::compute::ComputeTask invalid = scale;
+        invalid.b = {1, 2, 3, 4};                        // 2: invalid (scale takes no second input)
+        batch_tasks.push_back(invalid);
+        batch_tasks.push_back(multiply);                 // 3: valid
+
+        const vortyx::compute::BatchResult batch = gpu.execute_batch(batch_tasks);
+        vortyx::log(vortyx::LogLevel::Info,
+                    std::string("Batch executed in submission order: ") +
+                        to_string(batch.status) + " (" + std::to_string(batch.succeeded) +
+                            " succeeded, " + std::to_string(batch.failed) + " failed).");
+        for (std::size_t i = 0; i < batch.results.size(); ++i) {
+            vortyx::log(vortyx::LogLevel::Info,
+                        "  Batch task " + std::to_string(i) + ": " +
+                            to_string(batch.results[i].status) +
+                            (batch.results[i].status == vortyx::compute::Status::Ok
+                                 ? " (results kept, never discarded)"
+                                 : " - " + batch.results[i].error));
+        }
+
+        gpu.shutdown();
+    }
+
     vortyx::log(vortyx::LogLevel::Info, "Hardware discovery: implemented (Phase 2).");
     vortyx::log(vortyx::LogLevel::Info, "Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.");
@@ -673,7 +746,8 @@ int main() {
     vortyx::log(vortyx::LogLevel::Info, "Benchmark: implemented (Phase 8) - real-path measurement (VirtualGpu::execute end to end) with warmup, repeated iterations, min/average/median/max statistics, throughput and per-iteration correctness verification; measurements only, no performance claims.");
     vortyx::log(vortyx::LogLevel::Info, "Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.");
     vortyx::log(vortyx::LogLevel::Info, "Stabilization: implemented (Phase 9) - full stability audit of Phase 1~8; foreign Resource/Buffer handles from another Runtime are now rejected explicitly instead of being silently resolved by colliding per-manager ids; Vulkan execution failures preserve the failing Vulkan call and its VkResult; Runtime/VirtualGpu threading contracts and Buffer::valid() semantics documented; CI verifies the CPU-only build explicitly.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler).");
+    vortyx::log(vortyx::LogLevel::Info, "Compute Engine: implemented (Phase 10) - generic ComputeTask layer (elementwise int32 VectorAdd / VectorMultiply / VectorScale, bit-exact on every backend incl. overflow), one shared task->buffer->dispatch path for the legacy and generic APIs, synchronous batch execution with per-task results and honest partial success, CPU fork-join parallel execution for large workloads (bit-identical to sequential), per-op benchmark capability over the real execute() path; task data-parallel domain documented as the future partitioning seam.");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue.");
 
     return 0;
 }

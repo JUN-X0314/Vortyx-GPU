@@ -6,27 +6,30 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 9 (v0.9.0) — Stabilization
+## Current Phase: Phase 10 (v0.10.0) — Compute Engine
 
-Phase 9 adds **no new large feature**. It is a full stability audit of the Phase 1~8 codebase — memory safety, lifetime, thread safety, error handling, API consistency, build system, tests, CI, documentation — and ships only the fixes that make the existing implementation more trustworthy:
+Phase 10 turns the single-workload executor into a small **compute engine**: Vortyx now executes a *generic* `ComputeTask` — elementwise int32 operations (`VectorAdd`, `VectorMultiply`, `VectorScale`) — on both backends with bit-exact, fully defined semantics, adds honest synchronous **batch execution**, introduces **fork-join parallel execution** in the CPU backend for large workloads, and extends the benchmark to every operation. Everything still flows through the unchanged path: Virtual GPU → Runtime → Resource Manager → Backend.
 
-- **Foreign-buffer handles are now rejected instead of silently mis-executed (stability fix)**: resource ids are unique *per* ResourceManager, not globally. Executing valid `Buffer` handles from a *different* Runtime/Virtual GPU used to resolve them against the executing Runtime's own registry by raw id — if an id collided (easy: every registry starts at 1) and the access layout matched, the execution silently computed on the **wrong buffers** and returned `Status::Ok`, violating the backend contract "foreign buffers are rejected with an error, never accessed". `Runtime::execute(a, b, c)` now verifies ownership of all three handles first (`ResourceManager::owns_handle()`) and fails with a descriptive `Status::InvalidInput`. Covered by regression tests in both `ResourceTest` and `VirtualGpuTest`.
-- **Vulkan execution failures preserve their real cause**: `vkEndCommandBuffer`'s result is now checked before submitting (an invalid command buffer previously surfaced later as a misleading "vkQueueSubmit failed"), and `vkResetCommandBuffer` / `vkBeginCommandBuffer` / `vkEndCommandBuffer` / `vkQueueSubmit` / `vkQueueWaitIdle` failures all report the failing call **with its `VkResult`**.
-- **Lifecycle/threading contracts documented where they were only implied**: `Runtime` and `VirtualGpu` now state their external-serialization contract explicitly (one executor at a time; the TaskQueue worker becomes the only executor while a queue owns the Virtual GPU), and `Buffer::valid()` semantics after `shutdown()` are precise (handle-level check; operations decide liveness).
-- **CI now verifies the CPU-only build explicitly** (new `build-cpu-only` job: Windows + Ubuntu, `VORTYX_ENABLE_VULKAN=OFF`, full test suite) — the "building and running Vortyx never requires the Vulkan SDK" guarantee is now CI-enforced. The GPU-enabled job is unchanged.
-- **Everything else is unchanged**: the Phase 1~8 public APIs, the Scheduler policy (`vulkan` > `cpu`), the TaskQueue shutdown policy, the benchmark measurement semantics and the monitoring truthfulness rules are exactly as delivered in v0.8.0 and verified by the unchanged (plus two regression) test suites.
+- **`vortyx::compute::ComputeOp` / `ComputeTask` / `ComputeTaskResult`**: the generic task vocabulary (additive — `VectorAddTask` and every Phase 1~9 API are unchanged; `Runtime::execute(VectorAddTask)` is now a thin adapter over the same single task→buffer→dispatch path, so legacy and generic semantics cannot drift).
+- **Strict operand policy**: invalid input is refused with a reason, never guessed about (equal non-empty sizes for two-input ops; `VectorScale` takes exactly one input; unused operands must stay at their defaults). Integer semantics are **bit-exact across backends, overflow included**: `VectorMultiply`/`VectorScale` are *defined* modular arithmetic (uint32 multiply, two's complement — implemented with well-defined unsigned arithmetic on the CPU, natural wrapping in the GLSL kernels); `VectorAdd` keeps the Phase 3 safe-range policy.
+- **Batch execution (`execute_batch`)** — synchronous, NOT the TaskQueue: every task is attempted in submission order on ONE backend; each gets its own `ComputeTaskResult`; an invalid or failed task never stops later tasks and never discards earlier results; batch `status` is `Ok` only when all items succeed (otherwise the FIRST failing item's own status + an aggregate error). Wholesale refusals (uninitialized runtime, unknown/unavailable backend, empty batch) run nothing and say why.
+- **CPU fork-join parallel execution**: elementwise ops are index-independent, so partitioning cannot change a single bit of the result (pinned by tests). Workloads < 65536 elements run sequentially (thread setup can make small workloads SLOWER — explicit policy, not a hidden weakness); workers = min(`hardware_concurrency`, 8); per-dispatch fork-join with no shared state; thread-creation failure falls back to the calling thread (identical result, only slower). Build with `VORTYX_CPU_FORCE_SEQUENTIAL=ON` to A/B measure parallel-vs-sequential on the same machine.
+- **Vulkan backend**: one compute pipeline per op sharing one descriptor layout/set (embedded SPIR-V per kernel, common push-constant block `{count, scalar}`); `VectorScale` aliases the primary input into the unused read-only slot the kernel never reads — no dummy buffers; unknown/unavailable backends keep the exact Phase 5 honesty rules and there is still no silent fallback.
+- **Benchmark**: `benchmark_compute(gpu, ComputeTask, config)` measures the same real `execute()` path with the unchanged statistics/timing discipline; the exporter's `workload` key now carries the operation label (`vector_multiply`, ...) so different operations are never collapsed into one number. Correctness is verified on every iteration exactly as before.
+- **Phase 13 partitioning seam (structural only)**: every current op is elementwise over the documented data-parallel domain `[0, ComputeTask::element_count())` — the property future device/distributed phases need to split one task into logical ranges. No partitioning, multi-device or network code exists yet.
 
 ```
 Application → Scheduler (select the execution target)
             → Task Queue → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
+                                     ↘ ComputeTask (VectorAdd / VectorMultiply / VectorScale) — one task→buffer→dispatch path
 
-Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples)
+Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples, per-operation labels)
 Resource Monitor ── observes the Runtime / Device / allocation state (read-only)
 ```
 
-## Benchmark + Resource Monitoring (Phase 8)
+## Phase 9 — Stabilization (kept in force)
 
-The Phase 8 layers are unchanged in v0.9.0; this section documents what they are.
+The Phase 9 fixes are unchanged and still enforced: foreign buffer handles are rejected via ownership verification (`ResourceManager::owns_handle`), Vulkan failures preserve the failing call and its `VkResult`, the Runtime/VirtualGpu external-serialization contracts are documented, and CI verifies the CPU-only build. The Phase 8 layers (benchmark + monitoring) keep their documented semantics.
 
 **Implemented in Phase 8:**
 
@@ -38,7 +41,7 @@ The Phase 8 layers are unchanged in v0.9.0; this section documents what they are
 - **No fake metrics, ever**: a snapshot carries real values and explicit unavailable markers (`std::optional` = nullopt, validity flags) — never a 0 standing in for "unknown". Metrics that do not exist in the current stack (GPU utilization, temperature, power draw, instantaneous CPU utilization, current VRAM usage, fan speed, PCIe bandwidth) have **no field at all**: their absence is the honest representation. The monitor contains no platform-specific code and no second discovery path.
 - **Snapshot value semantics**: `ResourceSnapshot` is a plain value (strings, vectors, DeviceInfo copies) — it stays valid forever after the call, holds no reference into any object, and the monitor owns nothing (no lifecycle, no shutdown, never mutates or retains any Runtime resource).
 - **Scheduler independence**: monitoring and benchmarking are observation only. CPU usage, timings and allocation counts never influence selection — connecting measurements to scheduling is future work that this phase deliberately does not implement.
-- **`vortyx_bench`** (`src/benchmark_main.cpp`): a standalone, manually-run benchmark tool over a workload-size ladder (1K/16K/256K/1M elements — all far below the Phase 4 1 GiB per-buffer safety cap), CPU always and Vulkan when a device exists. Deliberately **not** registered as a CTest test: timing runs do not belong in the pass/fail CI suite; the test suite pins benchmark *invariants* instead.
+- **`vortyx_bench`** (`src/benchmark_main.cpp`): a standalone, manually-run benchmark tool; since Phase 10 it measures every ComputeOp over a workload-size ladder (1K/16K/256K/1M elements — all far below the Phase 4 1 GiB per-buffer safety cap), CPU always and Vulkan when a device exists. Deliberately **not** registered as a CTest test: timing runs do not belong in the pass/fail CI suite; the test suite pins benchmark *invariants* instead.
 
 **Phase 7 (unchanged)**: the Basic Scheduler remains the deterministic execution-target selection layer (explicit requests honored verbatim, automatic `vulkan` > `cpu` policy over real availability); its API, policy and tests are exactly as delivered in v0.7.0. Phase 8 data does not reach it.
 
@@ -249,6 +252,7 @@ gpu.shutdown();                        // Virtual GPU shuts down AFTER the queue
 | Basic Scheduler (Phase 7) | Execution-target selection (explicit request or automatic `vulkan` > `cpu` policy) from real backend availability | same |
 | Benchmark (Phase 8) | `steady_clock` timing around real `VirtualGpu::execute()` calls (end-to-end samples), warmup + measured iterations, statistics, per-iteration correctness | same |
 | Resource Monitoring (Phase 8) | Point-in-time `ResourceSnapshot` over the Runtime's real backend/device/allocation state (no platform-specific code, no second discovery path) | same |
+| Compute Engine (Phase 10) | Generic elementwise `ComputeTask` ops (VectorAdd / VectorMultiply / VectorScale, int32, bit-exact incl. defined modular overflow), synchronous batch execution, CPU fork-join parallel execution for large workloads | same |
 
 - DXGI is **discovery-only**; GPU computation goes through the Vulkan backend. The Virtual GPU never touches DXGI or Vulkan.
 - Vulkan was chosen because it is free/open-source, Windows-first friendly, compute-capable without any windowing system, and aligns with the long-term Vortyx roadmap.
@@ -298,8 +302,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.9.0
-  Phase:   9 (Stabilization)
+  Version: 0.10.0
+  Phase:   10 (Compute Engine)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -389,9 +393,9 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Compute Runtime initialized. Available backends: cpu, vulkan
 [INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
-[INFO] Benchmark 'vector_add' on 'cpu': 8192 elements x 10 iterations (1 warmup, excluded): avg 3.794 us, correctness verified.
-[INFO] Benchmark 'vector_add' on backend 'cpu' (device: Intel(R) Xeon(R) Processor): 8192 elements, 10 measured iterations (1 warmup, excluded): min 3.708 us | avg 3.794 us | median 3.779 us | max 4.060 us | stddev 95 ns | throughput 2.16 Gelem/s | correctness: PASS
-[INFO] Benchmark key=value export: workload=vector_add status=Ok backend=cpu device_type=Cpu device_name=Intel(R) Xeon(R) Processor element_count=8192 warmup_iterations=1 iterations=10 min_ns=3708 average_ns=3793.600 median_ns=3779.000 max_ns=4060 stddev_ns=95.396 throughput_elements_per_second=2159426402.362 correctness_verified=true
+[INFO] Benchmark 'vector_add' on 'cpu': 8192 elements x 10 iterations (1 warmup, excluded): avg 5.973 us, correctness verified.
+[INFO] Benchmark 'vector_add' on backend 'cpu' (device: Intel(R) Xeon(R) Processor): 8192 elements, 10 measured iterations (1 warmup, excluded): min 5.353 us | avg 5.973 us | median 5.468 us | max 8.456 us | stddev 937 ns | throughput 1.37 Gelem/s | correctness: PASS
+[INFO] Benchmark key=value export: workload=vector_add status=Ok backend=cpu device_type=Cpu device_name=Intel(R) Xeon(R) Processor element_count=8192 warmup_iterations=1 iterations=10 min_ns=5353 average_ns=5973.300 median_ns=5467.500 max_ns=8456 stddev_ns=937.076 throughput_elements_per_second=1371436224.533 correctness_verified=true
 [INFO] Post-benchmark resource stats: 0 live buffer(s), 0 live byte(s), 33 total allocation(s) (live must be 0: benchmark buffers are RAII).
 [INFO] Virtual GPU shut down.
 [INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
@@ -399,8 +403,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Compute Runtime initialized. Available backends: cpu, vulkan
 [INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Virtual GPU initialized (backend: vulkan, state: Ready, device: llvmpipe (LLVM 19.1.7, 256 bits))
-[INFO] Benchmark 'vector_add' on 'vulkan': 8192 elements x 10 iterations (1 warmup, excluded): avg 150.583 us, correctness verified.
-[INFO] Benchmark 'vector_add' on backend 'vulkan' (device: llvmpipe (LLVM 19.1.7, 256 bits)): 8192 elements, 10 measured iterations (1 warmup, excluded): min 140.741 us | avg 150.583 us | median 147.536 us | max 173.845 us | stddev 9.637 us | throughput 54.40 Melem/s | correctness: PASS
+[INFO] Benchmark 'vector_add' on 'vulkan': 8192 elements x 10 iterations (1 warmup, excluded): avg 155.947 us, correctness verified.
+[INFO] Benchmark 'vector_add' on backend 'vulkan' (device: llvmpipe (LLVM 19.1.7, 256 bits)): 8192 elements, 10 measured iterations (1 warmup, excluded): min 143.157 us | avg 155.947 us | median 153.952 us | max 170.072 us | stddev 8.462 us | throughput 52.53 Melem/s | correctness: PASS
 [INFO] Verification: vulkan benchmark target output matches the host reference (bit-exact).
 [INFO] Virtual GPU shut down.
 [INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
@@ -408,6 +412,19 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Compute Runtime initialized. Available backends: cpu, vulkan
 [INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Post-benchmark observation: hardware threads: 2, backends available: 2/2.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
+[INFO] Compute Engine (cpu) VectorMultiply success: C = A * B (10 -12 -10 0)
+[INFO] Compute Engine (cpu) VectorScale success: C = A * (-7) (-7 14 -21 28)
+[INFO] Batch executed in submission order: InvalidInput (3 succeeded, 1 failed).
+[INFO]   Batch task 0: Ok (results kept, never discarded)
+[INFO]   Batch task 1: Ok (results kept, never discarded)
+[INFO]   Batch task 2: InvalidInput - compute task 'VectorScale' carries a second input (b.size=4); scaling takes exactly one input — leave b empty
+[INFO]   Batch task 3: Ok (results kept, never discarded)
+[INFO] Virtual GPU shut down.
 [INFO] Hardware discovery: implemented (Phase 2).
 [INFO] Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.
 [INFO] Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.
@@ -417,7 +434,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Benchmark: implemented (Phase 8) - real-path measurement (VirtualGpu::execute end to end) with warmup, repeated iterations, min/average/median/max statistics, throughput and per-iteration correctness verification; measurements only, no performance claims.
 [INFO] Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.
 [INFO] Stabilization: implemented (Phase 9) - full stability audit of Phase 1~8; foreign Resource/Buffer handles from another Runtime are now rejected explicitly instead of being silently resolved by colliding per-manager ids; Vulkan execution failures preserve the failing Vulkan call and its VkResult; Runtime/VirtualGpu threading contracts and Buffer::valid() semantics documented; CI verifies the CPU-only build explicitly.
-[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler).
+[INFO] Compute Engine: implemented (Phase 10) - generic ComputeTask layer (elementwise int32 VectorAdd / VectorMultiply / VectorScale, bit-exact on every backend incl. overflow), one shared task->buffer->dispatch path for the legacy and generic APIs, synchronous batch execution with per-task results and honest partial success, CPU fork-join parallel execution for large workloads (bit-identical to sequential), per-op benchmark capability over the real execute() path; task data-parallel domain documented as the future partitioning seam.
+[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue.
 ```
 
 On a machine without any Vulkan device (or in a CPU-only build), the program instead prints `Vulkan Virtual GPU is not usable on this system: <reason>`, the automatic Scheduler selection becomes `backend='cpu'` with the real reason in its explanation (`'vulkan' is not usable on this system (...)`), the explicit `'vulkan'` selection is honestly refused with `No fallback was attempted` — never silently rerouted — and the Vulkan benchmark prints an explicit skip line (`Vulkan benchmark skipped: backend not usable on this system (...)`). The monitoring snapshot on such a machine shows the vulkan backend as `unavailable` with its real reason. The standalone `vortyx_bench` tool behaves the same way (`-> SKIP`; no fallback, nothing faked).
@@ -429,7 +447,9 @@ Vortyx-GPU/
 ├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible)
 ├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN option)
 ├── shaders/
-│   └── vector_add.comp             # Vector addition compute kernel (GLSL source)
+│   ├── vector_add.comp             # Vector addition compute kernel (GLSL source)
+│   ├── vector_multiply.comp        # Phase 10 elementwise multiply kernel
+│   └── vector_scale.comp           # Phase 10 elementwise scale kernel (scalar push constant)
 ├── scripts/
 │   └── embed_spv.py                # Embeds compiled SPIR-V into a C++ header
 ├── src/
@@ -463,6 +483,8 @@ Vortyx-GPU/
 │       └── monitor/                # Phase 8 Resource Monitoring
 │           └── monitor.hpp/.cpp      # ResourceMonitor (stateless), ResourceSnapshot, honest unavailable markers
 └── tests/
+    ├── test_compute_tasks.cpp     # Phase 10 Compute Engine CPU path: must pass everywhere
+    ├── test_compute_tasks_gpu.cpp # Phase 10 Compute Engine GPU path: real tests when Vulkan available
     ├── test_benchmark.cpp         # Benchmark CPU path: must pass everywhere
     ├── test_benchmark_gpu.cpp     # Benchmark GPU path: real tests when Vulkan available
     ├── test_monitor.cpp           # Resource Monitoring CPU path: must pass everywhere
@@ -484,11 +506,13 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.9.0 |
+| VersionTest | Version constants match 0.10.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
 | ComputeGpuTest | When a Vulkan device exists: real GPU vector addition, bit-exact CPU-vs-GPU verification, repeated-run determinism, resource cleanup via re-init. Without a device: explicit SKIP note (never faked success) |
+| ComputeTasksTest | Compute Engine CPU path (every system): strict `ComputeTask` validation (size mismatch, empty input, scalar/second-input misuse), every op vs the host reference at multiple sizes, `VectorScale` with negative/zero scalars, defined modular int32 semantics (multiply/scale overflow wraps, pinned), legacy `VectorAddTask` vs generic `ComputeTask` identity, parallel-CPU determinism and correctness on large workloads (300000 elements, above the fork-join threshold), Runtime error policies (invalid/unknown/shutdown), full batch semantics (mixed-ops all-Ok, partial success with an invalid item, per-item results in submission order, wholesale refusals: empty batch / unknown backend / uninitialized), VirtualGpu generic execute + batch + lifecycle gating, honest vulkan-backend behavior (adaptive, no fallback), TaskQueue integration of `ComputeTaskQueuedTask` (FIFO, exact results, honest invalid-task failure), no-leak accounting |
+| ComputeTasksGpuTest | When a Vulkan device exists: every op executes on the real Vulkan path and matches the host reference bit-exactly at sizes 1/64/1000/5000, defined modular multiply overflow (`INT32_MAX*2`, `-1*INT32_MIN`) wraps identically, cross-backend consistency (Vulkan vs an independent CPU Virtual GPU, bit-identical), batch through the Vulkan Virtual GPU, repeated-execution determinism, no-leak accounting. Without a device: explicit SKIP note (never faked success) |
 | ResourceTest | Full Buffer lifecycle on the CPU path: creation/info, write/read round-trips (full + partial), oversized/null/zero transfer rejection, zero-element/access/overflow/safety-cap rejection, unknown provider errors, invalid handles, move semantics (copy deleted, exactly-once ownership), RAII leak checks via stats, resource-based vector addition + validation errors (access roles, counts, element size, mixed/invalid handles), shutdown with live resources, handle outliving its Runtime, re-initialization, **foreign handles from another Runtime rejected with colliding ids (Phase 9 regression, both directions, no writes anywhere)** |
 | ResourceGpuTest | When a Vulkan device exists: real `VkBuffer`/`VkDeviceMemory` allocation through the resource layer, `memory_location() == Device` honesty, full create→write→execute→read→release cycles, bit-exact CPU-vs-GPU resource results, oversized-transfer rejection, mixed-backend rejection, shutdown with live GPU buffers, re-initialization. Without a device: explicit SKIP note (never faked success) |
 | VirtualGpuTest | Virtual GPU CPU path (every system): fresh-object state and refused operations, CPU initialization, vector addition vs reference, invalid tasks, unknown-backend early failure + recovery, idempotent re-init / refused reconfiguration, resource-based execution through `resources()`, dead-buffer rejection, **buffers of another Virtual GPU rejected via ownership verification (Phase 9 regression)**, honest known-but-unavailable backend behavior (no silent fallback), shutdown/re-init cycles, move semantics (exactly-once ownership, inert moved-from), buffer handles outliving their Virtual GPU |
@@ -506,7 +530,7 @@ No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs 
 
 ## Benchmark tool (vortyx_bench)
 
-The `vortyx_bench` executable (built alongside `vortyx`, from `src/benchmark_main.cpp`) runs the measurement ladder manually — 1K/16K/256K/1M int32 elements on the CPU backend always and the Vulkan backend when a device is really available, with warmup and per-result correctness verification, printing both the human-readable form and the stable key=value export. It is deliberately **not** part of the CTest suite: the CI verifies benchmark *invariants* (via `BenchmarkTest`/`BenchmarkGpuTest`), not timing numbers, so CI stays fast and flake-free.
+The `vortyx_bench` executable (built alongside `vortyx`, from `src/benchmark_main.cpp`) runs the measurement ladder manually — every ComputeOp (`vector_add` / `vector_multiply` / `vector_scale`) x 1K/16K/256K/1M int32 elements, on the CPU backend always and the Vulkan backend when a device is really available, with warmup and per-result correctness verification, printing both the human-readable form and the stable key=value export. Each operation is labeled separately; the tool never compares different operations as "better". It is deliberately **not** part of the CTest suite: the CI verifies benchmark *invariants* (via `BenchmarkTest`/`BenchmarkGpuTest`), not timing numbers, so CI stays fast and flake-free.
 
 Run it yourself when you want actual measurements; treat every number it prints as a measurement of that run on that machine, not as a performance claim. In particular, the measured scope is the end-to-end `execute()` call (allocation + upload + execution + readback + release) for BOTH backends — comparable in scope, but these numbers say nothing about which backend a scheduler "should" choose, and Phase 8 deliberately draws no such conclusion.
 
@@ -521,7 +545,8 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.6 | Task Queue and Async Execution (FIFO queue, one worker thread) | Implemented |
 | 0.7 | Basic Scheduler (deterministic execution-target selection: explicit request or automatic `vulkan` > `cpu` policy) | Implemented |
 | 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | Implemented |
-| 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | **Implemented (current)** |
+| 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | Implemented |
+| 0.10 | Compute Engine (generic elementwise ComputeTask layer: VectorAdd / VectorMultiply / VectorScale with bit-exact modular semantics, shared dispatch path, synchronous batch execution, CPU fork-join parallel execution, per-op benchmark capability, Phase 13 partitioning seam documented) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform | Planned |
 
 ## License

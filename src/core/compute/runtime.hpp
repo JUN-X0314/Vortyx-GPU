@@ -23,6 +23,21 @@
 //      the caller owns the buffer lifecycle explicitly: create -> write ->
 //      execute -> read -> release. Results stay inside the output buffer
 //      until the caller reads them.
+//   3. Generic task-based (Phase 10 — Compute Engine): execute(ComputeTask)
+//      runs any ComputeOp through the SAME task->buffer translation and ONE
+//      backend dispatch shape (ComputeDispatch). execute(VectorAddTask) is
+//      now a thin adapter over this path, so the legacy API and the generic
+//      engine can never drift apart in semantics or validation.
+//
+// Batch execution (Phase 10, synchronous — NOT the TaskQueue):
+//   execute_batch() submits a list of INDEPENDENT ComputeTasks to ONE
+//   backend in submission order and returns one ComputeTaskResult per task.
+//   Every task is attempted (invalid ones fail as their own item; earlier
+//   failures never stop later tasks); successful results are never
+//   discarded. The call returns only when every task reached a verdict —
+//   it holds no worker, no queue, no ordering beyond submission order.
+//   Asynchronous FIFO execution remains the TaskQueue's job (Phase 6),
+//   unchanged.
 //
 // GPU backend unavailability is a normal, non-fatal condition: if Vulkan
 // cannot initialize, initialize() still succeeds and CPU execution keeps
@@ -104,6 +119,24 @@ public:
     // dispatch -> download -> release). Unknown names and unavailable
     // backends return Status::BackendUnavailable with a descriptive error.
     VectorAddResult execute(const VectorAddTask& task, const std::string& backend_name);
+
+    // Generic task execution (Phase 10 — Compute Engine). Same translation
+    // and dispatch path as execute(VectorAddTask), for every ComputeOp the
+    // engine supports. Unknown names and unavailable backends return
+    // Status::BackendUnavailable with a descriptive error; invalid tasks
+    // return Status::InvalidInput with the reason and are never executed.
+    ComputeTaskResult execute(const ComputeTask& task);
+    ComputeTaskResult execute(const ComputeTask& task, const std::string& backend_name);
+
+    // Batch execution (Phase 10, synchronous): executes every task on the
+    // named backend in submission order and returns one result per task
+    // (see BatchResult for the exact per-item semantics). Wholesale
+    // refusals before any task runs (uninitialized runtime, unknown or
+    // unavailable backend, empty batch) return an empty 'results' with the
+    // real status and reason. Partial success is honest and expected:
+    // failed tasks never discard the results of the tasks that succeeded.
+    BatchResult execute_batch(const std::vector<ComputeTask>& tasks,
+                              const std::string& backend_name);
 
     // Resource-based execution (Phase 4): vector addition over three Buffer
     // resources that the caller created through resources().create_buffer().

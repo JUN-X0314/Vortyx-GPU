@@ -161,13 +161,33 @@ std::string format_throughput(double elements_per_second) {
 
 namespace {
 
-// The host-side correctness reference: C[i] == A[i] + B[i] (32-bit modular
-// addition, the same semantics every backend implements). Used ONLY for
-// verification, never timed, never reported as performance.
-std::vector<std::int32_t> expected_sum(const VectorAddTask& task) {
+// The host-side correctness reference for ONE generic compute task: the
+// expected output computed with the operation's integer semantics, in the
+// SAME defined way the CPU backend computes it (uint32 modular multiply for
+// multiply/scale — never signed-overflow UB; see cpu_backend.cpp). Used ONLY
+// for verification, never timed, never reported as performance. This is the
+// verification reference — the module still has no compute path of its own:
+// every measured number comes from VirtualGpu::execute().
+std::vector<std::int32_t> expected_output(const ComputeTask& task) {
     std::vector<std::int32_t> expected(task.a.size());
-    for (std::size_t i = 0; i < task.a.size(); ++i) {
-        expected[i] = task.a[i] + task.b[i];
+    switch (task.op) {
+        case ComputeOp::VectorAdd:
+            for (std::size_t i = 0; i < task.a.size(); ++i) {
+                expected[i] = task.a[i] + task.b[i];
+            }
+            break;
+        case ComputeOp::VectorMultiply:
+            for (std::size_t i = 0; i < task.a.size(); ++i) {
+                expected[i] = static_cast<std::int32_t>(static_cast<std::uint32_t>(task.a[i]) *
+                                                        static_cast<std::uint32_t>(task.b[i]));
+            }
+            break;
+        case ComputeOp::VectorScale:
+            for (std::size_t i = 0; i < task.a.size(); ++i) {
+                expected[i] = static_cast<std::int32_t>(static_cast<std::uint32_t>(task.a[i]) *
+                                                        static_cast<std::uint32_t>(task.scalar));
+            }
+            break;
     }
     return expected;
 }
@@ -175,7 +195,7 @@ std::vector<std::int32_t> expected_sum(const VectorAddTask& task) {
 // Full verification of one iteration's result against the reference. Returns
 // false (with a reason in 'why') for any wrong output — wrong size, wrong
 // value — so a broken backend can never produce a "passing" benchmark.
-bool result_matches(const VectorAddResult& result,
+bool result_matches(const ComputeTaskResult& result,
                     const std::vector<std::int32_t>& expected,
                     std::string& why) {
     if (result.status != Status::Ok) {
@@ -203,6 +223,18 @@ bool result_matches(const VectorAddResult& result,
 BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
                                      const VectorAddTask& task,
                                      const BenchmarkConfig& config) {
+    // Phase 10: the Phase 8 entry point adapts the legacy task into the
+    // generic engine and measures the ONE shared measurement path.
+    ComputeTask generic;
+    generic.op = ComputeOp::VectorAdd;
+    generic.a = task.a;
+    generic.b = task.b;
+    return benchmark_compute(gpu, generic, config);
+}
+
+BenchmarkResult benchmark_compute(vortyx::vgpu::VirtualGpu& gpu,
+                                  const ComputeTask& task,
+                                  const BenchmarkConfig& config) {
     BenchmarkResult result;
 
     // --- 1. Config validation (before anything executes) ---------------
@@ -214,17 +246,11 @@ BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
     }
 
     // --- 2. Task validation (the workload must be runnable at all) -----
-    if (task.a.size() != task.b.size()) {
-        result.status = Status::InvalidInput;
-        result.error = "benchmark task is invalid: input size mismatch (a=" +
-                       std::to_string(task.a.size()) + ", b=" +
-                       std::to_string(task.b.size()) + ")";
-        return result;
-    }
-    if (task.a.empty()) {
-        result.status = Status::InvalidInput;
-        result.error = "benchmark task is invalid: empty input (0 elements "
-                       "have nothing to measure)";
+    std::string validation_error;
+    const Status validation = validate_compute_task(task, validation_error);
+    if (validation != Status::Ok) {
+        result.status = validation;
+        result.error = "benchmark task is invalid: " + validation_error;
         return result;
     }
 
@@ -242,17 +268,18 @@ BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
     // --- 4. Record the target BEFORE measuring (honest even on failure).
     // The backend is exactly what the caller configured — the benchmark has
     // no ability and no permission to switch it (no silent fallback ever).
+    result.workload = workload_label(task.op);
     result.backend = gpu.backend_name();
     result.device = gpu.device_info();
     result.element_count = task.a.size();
     result.warmup_iterations = config.warmup_iterations;
     result.iterations = 0;
 
-    const std::vector<std::int32_t> expected = expected_sum(task);
+    const std::vector<std::int32_t> expected = expected_output(task);
 
     // --- 5. Warmup: real execution, verified, excluded from statistics --
     for (std::uint32_t w = 0; w < config.warmup_iterations; ++w) {
-        const VectorAddResult warm = gpu.execute(task);
+        const ComputeTaskResult warm = gpu.execute(task);
         std::string why;
         if (!result_matches(warm, expected, why)) {
             result.status = warm.status != Status::Ok ? warm.status : Status::BackendError;
@@ -270,7 +297,7 @@ BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
 
     for (std::uint32_t i = 0; i < config.iterations; ++i) {
         const auto begin = std::chrono::steady_clock::now();
-        const VectorAddResult run = gpu.execute(task);
+        const ComputeTaskResult run = gpu.execute(task);
         const auto end = std::chrono::steady_clock::now();
 
         result.iterations = i + 1;  // this attempt really happened
@@ -303,7 +330,7 @@ BenchmarkResult benchmark_vector_add(vortyx::vgpu::VirtualGpu& gpu,
     result.correctness_verified = true;
 
     vortyx::log(vortyx::LogLevel::Info,
-                "Benchmark 'vector_add' on '" + result.backend + "': " +
+                "Benchmark '" + result.workload + "' on '" + result.backend + "': " +
                     std::to_string(result.element_count) + " elements x " +
                     std::to_string(result.iterations) + " iterations (" +
                     std::to_string(result.warmup_iterations) +
@@ -333,7 +360,7 @@ const char* device_type_text(vortyx::device::DeviceType type) {
 
 std::string describe(const BenchmarkResult& result) {
     std::ostringstream os;
-    os << "Benchmark 'vector_add' on backend '" << result.backend << "'";
+    os << "Benchmark '" << result.workload << "' on backend '" << result.backend << "'";
 
     if (result.status != Status::Ok) {
         os << " FAILED: " << to_string(result.status) << " - " << result.error;
@@ -360,7 +387,7 @@ std::vector<std::pair<std::string, std::string>> to_key_values(const BenchmarkRe
     std::vector<std::pair<std::string, std::string>> pairs;
     pairs.reserve(15);
 
-    pairs.emplace_back("workload", "vector_add");
+    pairs.emplace_back("workload", result.workload);
     pairs.emplace_back("status", to_string(result.status));
     if (!result.error.empty()) pairs.emplace_back("error", result.error);
     pairs.emplace_back("backend", result.backend);

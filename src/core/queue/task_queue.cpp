@@ -67,6 +67,20 @@ VectorAddResult VectorAddQueuedTask::execute(vortyx::vgpu::VirtualGpu& gpu) {
 }
 
 // ---------------------------------------------------------------------------
+// ComputeTaskQueuedTask (Phase 10)
+// ---------------------------------------------------------------------------
+
+ComputeTaskQueuedTask::ComputeTaskQueuedTask(ComputeTask task) : task_(std::move(task)) {}
+
+VectorAddResult ComputeTaskQueuedTask::execute(vortyx::vgpu::VirtualGpu& gpu) {
+    // The engine path behind the same lifecycle/honesty rules. The result
+    // payload shape is identical today, so it is recorded in the queue's
+    // (unchanged) VectorAddResult vocabulary — see the header note.
+    const vortyx::compute::ComputeTaskResult result = gpu.execute(task_);
+    return VectorAddResult{result.status, std::move(result.error), std::move(result.data)};
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 

@@ -25,6 +25,8 @@
 #if defined(VORTYX_HAS_VULKAN)
 
 #include "core/compute/vector_add_spv.hpp"
+#include "core/compute/vector_multiply_spv.hpp"
+#include "core/compute/vector_scale_spv.hpp"
 #include "core/device/vendor_names.hpp"
 #include "core/version.hpp"
 #include "core/logger.hpp"
@@ -95,7 +97,14 @@ struct VulkanBackend::Impl {
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    // Phase 10: ONE compute pipeline per ComputeOp, sharing ONE descriptor
+    // set layout / pool / set. Indexed by static_cast<int>(ComputeOp); a
+    // null entry means "this build cannot execute that op" (reported as a
+    // BackendError with the op name — never guessed around).
+    static constexpr int kOpCount = 3;
+    VkPipeline pipelines[kOpCount] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;  // freed with the pool
 
@@ -118,9 +127,11 @@ struct VulkanBackend::Impl {
                 vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
                 descriptor_pool = VK_NULL_HANDLE;
             }
-            if (pipeline != VK_NULL_HANDLE) {
-                vkDestroyPipeline(device, pipeline, nullptr);
-                pipeline = VK_NULL_HANDLE;
+            for (int op = 0; op < kOpCount; ++op) {
+                if (pipelines[op] != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(device, pipelines[op], nullptr);
+                    pipelines[op] = VK_NULL_HANDLE;
+                }
             }
             if (pipeline_layout != VK_NULL_HANDLE) {
                 vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
@@ -327,7 +338,10 @@ bool VulkanBackend::initialize() {
         VkPushConstantRange push_range{};
         push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push_range.offset = 0;
-        push_range.size = sizeof(std::uint32_t);  // element count
+        // Phase 10 shared elementwise push-constant block: { uint count;
+        // int scalar; }. The add/multiply kernels ignore the scalar — the
+        // block is shared so ONE pipeline layout serves every op pipeline.
+        push_range.size = sizeof(std::uint32_t) + sizeof(std::int32_t);
 
         VkPipelineLayoutCreateInfo pipeline_layout_info{};
         pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -345,40 +359,64 @@ bool VulkanBackend::initialize() {
             break;
         }
 
-        VkShaderModuleCreateInfo shader_info{};
-        shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        shader_info.codeSize = detail::kVectorAdd_spv_size;
-        shader_info.pCode = reinterpret_cast<const std::uint32_t*>(detail::kVectorAdd_spv);
+        // --- 5b. One compute pipeline per ComputeOp (Phase 10) -------------
+        // Every kernel shares the layout above and declares the same push
+        // constant block; each kernel implements exactly one operation.
+        struct OpShader {
+            ComputeOp op;
+            const unsigned char* code;
+            std::size_t code_size;
+            const char* name;
+        };
+        const OpShader op_shaders[Impl::kOpCount] = {
+            {ComputeOp::VectorAdd, detail::kVectorAdd_spv, detail::kVectorAdd_spv_size,
+             "vector_add"},
+            {ComputeOp::VectorMultiply, detail::kVectorMultiply_spv,
+             detail::kVectorMultiply_spv_size, "vector_multiply"},
+            {ComputeOp::VectorScale, detail::kVectorScale_spv, detail::kVectorScale_spv_size,
+             "vector_scale"},
+        };
 
-        VkShaderModule shader_module = VK_NULL_HANDLE;
-        vk = vkCreateShaderModule(impl->device, &shader_info, nullptr, &shader_module);
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkCreateShaderModule failed";
-            fail_detail = vk_result_name(vk);
-            ok = false;
-            break;
+        for (const OpShader& shader : op_shaders) {
+            VkShaderModuleCreateInfo shader_info{};
+            shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            shader_info.codeSize = shader.code_size;
+            shader_info.pCode = reinterpret_cast<const std::uint32_t*>(shader.code);
+
+            VkShaderModule shader_module = VK_NULL_HANDLE;
+            vk = vkCreateShaderModule(impl->device, &shader_info, nullptr, &shader_module);
+            if (vk != VK_SUCCESS) {
+                fail = std::string("Vulkan: vkCreateShaderModule failed for '") +
+                       shader.name + "'";
+                fail_detail = vk_result_name(vk);
+                ok = false;
+                break;
+            }
+
+            VkPipelineShaderStageCreateInfo stage{};
+            stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stage.module = shader_module;
+            stage.pName = "main";
+
+            VkComputePipelineCreateInfo pipeline_info{};
+            pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pipeline_info.stage = stage;
+            pipeline_info.layout = impl->pipeline_layout;
+
+            const int op_index = static_cast<int>(shader.op);
+            vk = vkCreateComputePipelines(impl->device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                          nullptr, &impl->pipelines[op_index]);
+            vkDestroyShaderModule(impl->device, shader_module, nullptr);  // no longer needed
+            if (vk != VK_SUCCESS) {
+                fail = std::string("Vulkan: vkCreateComputePipelines failed for '") +
+                       shader.name + "'";
+                fail_detail = vk_result_name(vk);
+                ok = false;
+                break;
+            }
         }
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = shader_module;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo pipeline_info{};
-        pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipeline_info.stage = stage;
-        pipeline_info.layout = impl->pipeline_layout;
-
-        vk = vkCreateComputePipelines(impl->device, VK_NULL_HANDLE, 1, &pipeline_info,
-                                      nullptr, &impl->pipeline);
-        vkDestroyShaderModule(impl->device, shader_module, nullptr);  // no longer needed
-        if (vk != VK_SUCCESS) {
-            fail = "Vulkan: vkCreateComputePipelines failed";
-            fail_detail = vk_result_name(vk);
-            ok = false;
-            break;
-        }
+        if (!ok) break;
 
         // --- 6. Descriptor pool + one descriptor set ------------------------
         VkDescriptorPoolSize pool_size{};
@@ -512,20 +550,53 @@ vortyx::device::DeviceInfo VulkanBackend::device_info() const {
 ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
                                      const vortyx::resource::IBufferImpl& b,
                                      vortyx::resource::IBufferImpl& c) {
+    // Phase 4 contract kept verbatim: this signature IS vector addition.
+    ComputeDispatch dispatch;
+    dispatch.op = ComputeOp::VectorAdd;
+    dispatch.input_a = &a;
+    dispatch.input_b = &b;
+    dispatch.output = &c;
+    return execute(dispatch);
+}
+
+ComputeResult VulkanBackend::execute(const ComputeDispatch& dispatch) {
     if (impl_ == nullptr || !initialized_) {
         return ComputeResult{Status::NotInitialized,
                              "Vulkan backend is not initialized (call Runtime::initialize first)"};
     }
     Impl* impl = impl_;
 
+    // The dispatch must name a real operation and this build must have its
+    // pipeline. An unknown op is a caller bug; a missing pipeline would mean
+    // a shader failed to build — both are explicit errors, never guessed
+    // around.
+    const int op_index = static_cast<int>(dispatch.op);
+    if (op_index < 0 || op_index >= Impl::kOpCount) {
+        return ComputeResult{Status::InvalidInput,
+                             "compute dispatch names an unknown operation"};
+    }
+    if (impl->pipelines[op_index] == VK_NULL_HANDLE) {
+        return ComputeResult{Status::BackendError,
+                             std::string("Vulkan backend has no pipeline for operation '") +
+                                 to_string(dispatch.op) + "'"};
+    }
+
     // The buffers must belong to the vulkan backend. Anything else means a
     // routing bug; reject it instead of binding foreign memory.
+    if (dispatch.input_a == nullptr || dispatch.output == nullptr) {
+        return ComputeResult{Status::InvalidInput,
+                             "compute dispatch is missing its input/output buffers"};
+    }
     const vortyx::resource::VulkanBuffer* vk_a =
-        dynamic_cast<const vortyx::resource::VulkanBuffer*>(&a);
+        dynamic_cast<const vortyx::resource::VulkanBuffer*>(dispatch.input_a);
     const vortyx::resource::VulkanBuffer* vk_b =
-        dynamic_cast<const vortyx::resource::VulkanBuffer*>(&b);
-    vortyx::resource::VulkanBuffer* vk_c = dynamic_cast<vortyx::resource::VulkanBuffer*>(&c);
-    if (vk_a == nullptr || vk_b == nullptr || vk_c == nullptr) {
+        dispatch.input_b != nullptr
+            ? dynamic_cast<const vortyx::resource::VulkanBuffer*>(dispatch.input_b)
+            : nullptr;
+    vortyx::resource::VulkanBuffer* vk_c =
+        dynamic_cast<vortyx::resource::VulkanBuffer*>(dispatch.output);
+    if (vk_a == nullptr || vk_c == nullptr ||
+        (dispatch.input_b != nullptr && vk_b == nullptr)) {
         return ComputeResult{Status::BackendError,
                              "buffer does not belong to the vulkan backend"};
     }
@@ -533,29 +604,37 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
     // The buffers must have been allocated on THIS backend's device (Phase 4
     // guards against mixing devices; multi-GPU aggregation is not a Phase 4
     // feature).
-    if (vk_a->vk_device() != impl->device || vk_b->vk_device() != impl->device ||
-        vk_c->vk_device() != impl->device) {
+    if (vk_a->vk_device() != impl->device || vk_c->vk_device() != impl->device ||
+        (vk_b != nullptr && vk_b->vk_device() != impl->device)) {
         return ComputeResult{Status::BackendError,
                              "buffer was not allocated on this backend's Vulkan device"};
     }
 
-    // Shared task rules: int32 elements, equal non-zero counts, Read inputs,
-    // Write output. Enforced here so direct backend users cannot bypass it.
+    // Shared op rules: int32 elements, equal non-zero counts, Read inputs,
+    // Write output, op-specific input count. Enforced here so direct backend
+    // users cannot bypass it.
     std::string validation_error;
-    const Status validation =
-        validate_vector_add_buffers(a.desc(), b.desc(), c.desc(), validation_error);
+    const Status validation = validate_compute_dispatch_buffers(
+        dispatch.op, dispatch.input_a->desc(),
+        dispatch.input_b != nullptr ? &dispatch.input_b->desc() : nullptr,
+        dispatch.output->desc(), validation_error);
     if (validation != Status::Ok) {
         return ComputeResult{validation, validation_error};
     }
 
-    const std::uint32_t count_u32 = static_cast<std::uint32_t>(a.desc().element_count);
+    const std::uint32_t count_u32 =
+        static_cast<std::uint32_t>(dispatch.input_a->desc().element_count);
 
     // Bind the resource-owned buffers to the descriptor set. The set itself
     // is the same fixed 3-binding set as Phase 3; only the bindings' targets
     // (Resource-Manager-owned storage) change per execution.
+    // VectorScale takes no second input, but the SHARED descriptor layout
+    // still declares binding 1: the primary input's buffer is aliased into
+    // that slot as a read-only placeholder that the scale kernel NEVER reads
+    // (declared in the shader source). No dummy allocation, no hidden state.
     const VkDescriptorBufferInfo buffer_infos[3] = {
         {vk_a->vk_buffer(), 0, VK_WHOLE_SIZE},
-        {vk_b->vk_buffer(), 0, VK_WHOLE_SIZE},
+        {dispatch.input_b != nullptr ? vk_b->vk_buffer() : vk_a->vk_buffer(), 0, VK_WHOLE_SIZE},
         {vk_c->vk_buffer(), 0, VK_WHOLE_SIZE},
     };
 
@@ -586,12 +665,22 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
                              "Vulkan: vkBeginCommandBuffer failed (" + vk_result_name(vk) + ")"};
     }
 
-    vkCmdBindPipeline(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, impl->pipeline);
+    vkCmdBindPipeline(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      impl->pipelines[op_index]);
     vkCmdBindDescriptorSets(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             impl->pipeline_layout, 0, 1, &impl->descriptor_set, 0, nullptr);
 
+    // Shared elementwise push-constant block: { uint count; int scalar; }.
+    // The add/multiply kernels ignore the scalar; the scale kernel uses it.
+    struct PushConstants {
+        std::uint32_t count;
+        std::int32_t scalar;
+    } push_constants{count_u32, dispatch.scalar};
+    static_assert(sizeof(PushConstants) == sizeof(std::uint32_t) + sizeof(std::int32_t),
+                  "push-constant block must match the shared shader layout");
     vkCmdPushConstants(impl->command_buffer, impl->pipeline_layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(std::uint32_t), &count_u32);
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants),
+                       &push_constants);
 
     const std::uint32_t groups = (count_u32 + kWorkgroupSize - 1) / kWorkgroupSize;
     vkCmdDispatch(impl->command_buffer, groups, 1, 1);
@@ -655,6 +744,11 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
     (void)a;
     (void)b;
     (void)c;
+    return ComputeResult{Status::BackendUnavailable, unavailable_reason_};
+}
+
+ComputeResult VulkanBackend::execute(const ComputeDispatch& dispatch) {
+    (void)dispatch;
     return ComputeResult{Status::BackendUnavailable, unavailable_reason_};
 }
 

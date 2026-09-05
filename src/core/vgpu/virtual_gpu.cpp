@@ -197,6 +197,46 @@ VectorAddResult VirtualGpu::execute(const VectorAddTask& task) {
     return runtime_->execute(task, desc_.backend);
 }
 
+ComputeTaskResult VirtualGpu::execute(const ComputeTask& task) {
+    // ShutDown is checked first: after shutdown() the Runtime pointer is
+    // null too, and the caller deserves the precise reason, not a generic
+    // "not initialized". Same gating as execute(VectorAddTask) above.
+    if (state_ == State::ShutDown) {
+        return ComputeTaskResult{Status::NotInitialized,
+                                 "Virtual GPU is shut down "
+                                 "(call initialize() again before execute())",
+                                 {}};
+    }
+    if (state_ == State::Uninitialized || runtime_ == nullptr) {
+        return ComputeTaskResult{Status::NotInitialized,
+                                 "Virtual GPU is not initialized "
+                                 "(call initialize() before execute())",
+                                 {}};
+    }
+
+    // Straight delegation to the Runtime on the configured backend — the
+    // generic engine path behind the unchanged lifecycle rules. No
+    // automatic backend choice, no silent fallback.
+    return runtime_->execute(task, desc_.backend);
+}
+
+BatchResult VirtualGpu::execute_batch(const std::vector<ComputeTask>& tasks) {
+    BatchResult batch;
+    if (state_ == State::ShutDown) {
+        batch.status = Status::NotInitialized;
+        batch.error = "Virtual GPU is shut down "
+                      "(call initialize() again before execute_batch())";
+        return batch;
+    }
+    if (state_ == State::Uninitialized || runtime_ == nullptr) {
+        batch.status = Status::NotInitialized;
+        batch.error = "Virtual GPU is not initialized "
+                      "(call initialize() before execute_batch())";
+        return batch;
+    }
+    return runtime_->execute_batch(tasks, desc_.backend);
+}
+
 ComputeResult VirtualGpu::execute(const vortyx::resource::Buffer& a,
                                   const vortyx::resource::Buffer& b,
                                   vortyx::resource::Buffer& c) {
