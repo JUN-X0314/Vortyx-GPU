@@ -145,7 +145,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   10 (Compute Engine)" << std::endl;
+    std::cout << "  Phase:   11 (Platform Foundation)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -747,7 +747,8 @@ int main() {
     vortyx::log(vortyx::LogLevel::Info, "Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.");
     vortyx::log(vortyx::LogLevel::Info, "Stabilization: implemented (Phase 9) - full stability audit of Phase 1~8; foreign Resource/Buffer handles from another Runtime are now rejected explicitly instead of being silently resolved by colliding per-manager ids; Vulkan execution failures preserve the failing Vulkan call and its VkResult; Runtime/VirtualGpu threading contracts and Buffer::valid() semantics documented; CI verifies the CPU-only build explicitly.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Engine: implemented (Phase 10) - generic ComputeTask layer (elementwise int32 VectorAdd / VectorMultiply / VectorScale, bit-exact on every backend incl. overflow), one shared task->buffer->dispatch path for the legacy and generic APIs, synchronous batch execution with per-task results and honest partial success, CPU fork-join parallel execution for large workloads (bit-identical to sequential), per-op benchmark capability over the real execute() path; task data-parallel domain documented as the future partitioning seam.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue.");
+    vortyx::log(vortyx::LogLevel::Info, "Platform Foundation: implemented (Phase 11) - provider-neutral control-plane layer (vortyx::platform, src/platform/): device identity + self-reported metadata, JobEnvelope/ResultEnvelope transport contracts (no data payload, ComputeTask stays local), job lifecycle with documented transitions, AuthN/AuthZ boundary with the RLS-equivalent ownership rule, provider-neutral IPlatformStore with the local/mock InMemoryPlatformStore, a strict standard-library JSON module and the API contract codec pinned by tests; Supabase schema/RLS migration and the Vercel-ready API layer (platform/api) prepared for the owner's post-Phase-11 deployment; the compute core knows nothing about any of it (VORTYX_ENABLE_PLATFORM=OFF builds exactly like Phase 10).");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue, remote/distributed execution of platform jobs (Phase 12+ device agents), real-time device telemetry.");
 
     return 0;
 }

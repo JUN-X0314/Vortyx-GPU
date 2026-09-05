@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.10.0
+    VERSION 0.11.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -12,6 +12,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(VORTYX_BUILD_TESTS "Build Vortyx tests" ON)
 option(VORTYX_ENABLE_VULKAN "Enable the Vulkan GPU compute backend (requires Vulkan headers + loader)" ON)
+# Phase 11: the platform (control-plane) layer. Pure standard-library C++ —
+# no cloud SDK, no HTTP client, no JSON dependency. OFF builds the project
+# exactly like every release before Phase 11 (the core never depends on it).
+option(VORTYX_ENABLE_PLATFORM "Build the Vortyx platform (control-plane) layer" ON)
 
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
@@ -80,6 +84,26 @@ add_library(vortyx_core STATIC
     src/core/monitor/monitor.cpp
 )
 target_include_directories(vortyx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Platform (control-plane) layer (Phase 11).
+# A SEPARATE static library on purpose: the layering is enforced by the build
+# graph. vortyx_core never links or includes vortyx_platform; platform
+# depends on the core only for the operation vocabulary (ComputeOp labels)
+# and the version string. Contains no cloud SDK and no network code — the
+# real backend sits behind the provider-neutral IPlatformStore interface.
+if(VORTYX_ENABLE_PLATFORM)
+    add_library(vortyx_platform STATIC
+        src/platform/status.cpp          # control-plane result vocabulary
+        src/platform/identity.cpp        # DeviceId/JobId/UserId + UUID v4 generation
+        src/platform/metadata.cpp        # DeviceMetadata + contract vocabularies
+        src/platform/job.cpp             # JobStatus/JobEnvelope/ResultEnvelope + transitions
+        src/platform/auth.cpp            # AuthContext + ownership rules (the RLS mirror)
+        src/platform/json.cpp            # minimal strict JSON (adapter boundary)
+        src/platform/contract.cpp        # API contract codec (requests/responses/status codes)
+        src/platform/memory_store.cpp    # InMemoryPlatformStore (local/mock)
+    )
+    target_link_libraries(vortyx_platform PUBLIC vortyx_core)
+endif()
 
 # GPU discovery on Windows uses DXGI (part of the Windows OS/SDK, no external
 # dependency). Only linked on Windows targets.

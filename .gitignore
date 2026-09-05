@@ -71,6 +71,14 @@ vcpkg_installed/
 .vscode/
 .idea/
 
+# Environment / secret files — real keys are NEVER committed
+.env
+.env.*
+!.env.example
+
+# Node (platform/api)
+node_modules/
+
 # test output & cache
 Testing/
 .cache/

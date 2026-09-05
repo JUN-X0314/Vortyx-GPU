@@ -1,0 +1,17 @@
+{
+  "name": "@vortyx/platform-api",
+  "version": "0.11.0",
+  "private": true,
+  "description": "Vortyx GPU platform control-plane API (Phase 11: Vercel-ready structure, Supabase-ready adapter, local/mock mode)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types",
+    "dev": "node dev-server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}

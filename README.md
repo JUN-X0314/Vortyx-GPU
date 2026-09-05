@@ -6,7 +6,37 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 10 (v0.10.0) — Compute Engine
+## Current Phase: Phase 11 (v0.11.0) — Platform / Cloud Layer Foundation
+
+Phase 11 builds the **Platform Control Plane Foundation**: the stable boundary between today's local compute engine and the future multi-device / distributed phases. It adds a provider-neutral platform layer (`vortyx::platform`, `src/platform/`) — device identity, self-reported metadata, the job submission/status/result contracts, an authentication/authorization boundary, a provider-neutral `IPlatformStore` with a local/mock reference implementation, a strict standard-library JSON module, and the API contract codec — plus a Supabase-ready schema with Row Level Security (`platform/supabase/migrations/`) and a Vercel-ready API structure (`platform/api/`, TypeScript). The compute core knows nothing about any of it.
+
+- **Provider-neutral, never Supabase-shaped**: the API layer speaks only `IPlatformStore`; concrete providers live behind it. The C++ repository ships no provider implementation and the platform layer adds zero external dependencies (standard library only). `VORTYX_ENABLE_PLATFORM=OFF` builds exactly like Phase 10.
+- **Core purity enforced by the build graph**: `vortyx_core` never links or includes `vortyx_platform`. No Supabase/Vercel/HTTP/JSON/JWT knowledge exists anywhere below the platform boundary.
+- **`ComputeTask` ≠ `JobEnvelope`**: the local execution object keeps its data and its path; the transport contract carries only metadata (which operation, how big, who wants it) and deliberately no payload. They share exactly one thing — the operation vocabulary (`ComputeOp` labels), so names cannot drift.
+- **Honest job lifecycle**: `JobStatus` (queued → running → completed/failed/cancelled) is the control-plane lifecycle, deliberately separate from the Phase 6 TaskQueue's `TaskState`. Transitions are a documented, tested table; failures require a reason; terminal states are final everywhere (store, API, database CHECK constraints).
+- **AuthN/AuthZ boundary with defense in depth**: verified subject ≠ client-claimed id; the single ownership rule (`auth.uid() = owner_user_id`) is enforced identically by the store layer, the API layer and Supabase RLS. Foreign records are INVISIBLE (404, RLS equivalence) — never a 403 that would leak which ids exist.
+- **Local/mock mode is honest**: `InMemoryPlatformStore` persists nothing and says so; the local token scheme (`Bearer local:<user_id>`) is a development convenience, loudly documented. No Supabase account, no Vercel project and no secrets are needed to build, test or run anything in Phase 11.
+- **Strict JSON + contract codec in C++**: the wire contract is implemented twice (C++ and TypeScript) and pinned by tests on BOTH sides — same routes, same schemas, same error codes (`invalid_json`, `missing_field`, `invalid_enum`, …), same status mapping (400/401/403/404/405/409/422/500).
+- **No fake telemetry**: device capabilities are self-reported and vocabulary-validated; capacity/battery/load fields do not exist yet and are documented as Phase 12+ seams. `JobEnvelope::priority` is a RESERVED transport field that nothing reads.
+
+**Actual Supabase project configuration and Vercel deployment are intentionally deferred until after Phase 11 implementation.** The schema, migration, RLS policies, environment-variable design, deployment checklist and local/mock development flow are all in place and documented (`docs/platform/`).
+
+**Not implemented in Phase 11 (by design)**: distributed execution, multi-device execution, remote workers, work stealing, resource-aware scheduling, task partitioning, real-time device telemetry, remote execution of submitted jobs (a submitted job is `queued` and currently ends there — execution arrives with the Phase 12+ device agents).
+
+```
+Application → Scheduler (select the execution target)
+            → Task Queue → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
+                                     ↘ ComputeTask (VectorAdd / VectorMultiply / VectorScale) — one task→buffer→dispatch path
+
+Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples, per-operation labels)
+Resource Monitor ── observes the Runtime / Device / allocation state (read-only)
+
+Platform (Phase 11) ── identity · metadata · job contract · auth boundary
+            └─ IPlatformStore → InMemoryPlatformStore (local/mock) | (behind the seam) Supabase + Vercel API
+               (the compute path knows NOTHING about this layer)
+```
+
+## Phase 10 — Compute Engine (v0.10.0, kept in force)
 
 Phase 10 turns the single-workload executor into a small **compute engine**: Vortyx now executes a *generic* `ComputeTask` — elementwise int32 operations (`VectorAdd`, `VectorMultiply`, `VectorScale`) — on both backends with bit-exact, fully defined semantics, adds honest synchronous **batch execution**, introduces **fork-join parallel execution** in the CPU backend for large workloads, and extends the benchmark to every operation. Everything still flows through the unchanged path: Virtual GPU → Runtime → Resource Manager → Backend.
 
@@ -17,15 +47,6 @@ Phase 10 turns the single-workload executor into a small **compute engine**: Vor
 - **Vulkan backend**: one compute pipeline per op sharing one descriptor layout/set (embedded SPIR-V per kernel, common push-constant block `{count, scalar}`); `VectorScale` aliases the primary input into the unused read-only slot the kernel never reads — no dummy buffers; unknown/unavailable backends keep the exact Phase 5 honesty rules and there is still no silent fallback.
 - **Benchmark**: `benchmark_compute(gpu, ComputeTask, config)` measures the same real `execute()` path with the unchanged statistics/timing discipline; the exporter's `workload` key now carries the operation label (`vector_multiply`, ...) so different operations are never collapsed into one number. Correctness is verified on every iteration exactly as before.
 - **Phase 13 partitioning seam (structural only)**: every current op is elementwise over the documented data-parallel domain `[0, ComputeTask::element_count())` — the property future device/distributed phases need to split one task into logical ranges. No partitioning, multi-device or network code exists yet.
-
-```
-Application → Scheduler (select the execution target)
-            → Task Queue → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
-                                     ↘ ComputeTask (VectorAdd / VectorMultiply / VectorScale) — one task→buffer→dispatch path
-
-Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples, per-operation labels)
-Resource Monitor ── observes the Runtime / Device / allocation state (read-only)
-```
 
 ## Phase 9 — Stabilization (kept in force)
 
@@ -49,7 +70,7 @@ The Phase 9 fixes are unchanged and still enforced: foreign buffer handles are r
 
 **Phase 5 (unchanged)**: the Virtual GPU remains the single logical compute device per explicitly chosen backend (`"cpu"`, `"vulkan"`), with no automatic selection and no silent fallback inside the Virtual GPU itself; its API and tests are exactly as delivered in v0.5.0.
 
-**Not implemented yet** (later phases): Multi-GPU, load balancing, work stealing, priority scheduling, task graphs, memory pooling / suballocation, network workers, distributed computing, performance-based / resource-aware scheduling (no hardware metrics are consumed — the codebase has none, and Phase 8 deliberately does not connect its measurements to the Scheduler), advanced schedulers of any kind, FPGA/own hardware.
+**Not implemented yet** (later phases): Multi-GPU, load balancing, work stealing, priority scheduling, task graphs, memory pooling / suballocation, network workers, distributed computing, remote/distributed execution of platform jobs (Phase 12+ device agents — a Phase 11 submitted job is `queued` and currently ends there), real-time device telemetry, performance-based / resource-aware scheduling (no hardware metrics are consumed — the codebase has none, and Phase 8 deliberately does not connect its measurements to the Scheduler), advanced schedulers of any kind, FPGA/own hardware.
 
 ## Benchmark concepts (Phase 8)
 
@@ -253,6 +274,7 @@ gpu.shutdown();                        // Virtual GPU shuts down AFTER the queue
 | Benchmark (Phase 8) | `steady_clock` timing around real `VirtualGpu::execute()` calls (end-to-end samples), warmup + measured iterations, statistics, per-iteration correctness | same |
 | Resource Monitoring (Phase 8) | Point-in-time `ResourceSnapshot` over the Runtime's real backend/device/allocation state (no platform-specific code, no second discovery path) | same |
 | Compute Engine (Phase 10) | Generic elementwise `ComputeTask` ops (VectorAdd / VectorMultiply / VectorScale, int32, bit-exact incl. defined modular overflow), synchronous batch execution, CPU fork-join parallel execution for large workloads | same |
+| Platform Foundation (Phase 11) | Provider-neutral control-plane layer: identity/metadata/job contracts, auth boundary, `IPlatformStore` + local/mock store, strict JSON + contract codec — standard-library C++ only, no network code | Supabase schema + RLS (`platform/supabase/migrations`) and the Vercel-ready API layer (`platform/api`, TypeScript, local/mock mode) — deployment intentionally deferred |
 
 - DXGI is **discovery-only**; GPU computation goes through the Vulkan backend. The Virtual GPU never touches DXGI or Vulkan.
 - Vulkan was chosen because it is free/open-source, Windows-first friendly, compute-capable without any windowing system, and aligns with the long-term Vortyx roadmap.
@@ -302,8 +324,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.10.0
-  Phase:   10 (Compute Engine)
+  Version: 0.11.0
+  Phase:   11 (Platform Foundation)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -435,7 +457,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.
 [INFO] Stabilization: implemented (Phase 9) - full stability audit of Phase 1~8; foreign Resource/Buffer handles from another Runtime are now rejected explicitly instead of being silently resolved by colliding per-manager ids; Vulkan execution failures preserve the failing Vulkan call and its VkResult; Runtime/VirtualGpu threading contracts and Buffer::valid() semantics documented; CI verifies the CPU-only build explicitly.
 [INFO] Compute Engine: implemented (Phase 10) - generic ComputeTask layer (elementwise int32 VectorAdd / VectorMultiply / VectorScale, bit-exact on every backend incl. overflow), one shared task->buffer->dispatch path for the legacy and generic APIs, synchronous batch execution with per-task results and honest partial success, CPU fork-join parallel execution for large workloads (bit-identical to sequential), per-op benchmark capability over the real execute() path; task data-parallel domain documented as the future partitioning seam.
-[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue.
+[INFO] Platform Foundation: implemented (Phase 11) - provider-neutral control-plane layer (vortyx::platform, src/platform/): device identity + self-reported metadata, JobEnvelope/ResultEnvelope transport contracts (no data payload, ComputeTask stays local), job lifecycle with documented transitions, AuthN/AuthZ boundary with the RLS-equivalent ownership rule, provider-neutral IPlatformStore with the local/mock InMemoryPlatformStore, a strict standard-library JSON module and the API contract codec pinned by tests; Supabase schema/RLS migration and the Vercel-ready API layer (platform/api) prepared for the owner's post-Phase-11 deployment; the compute core knows nothing about any of it (VORTYX_ENABLE_PLATFORM=OFF builds exactly like Phase 10).
+[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler), task partitioning across device workers, memory pooling/suballocation, asynchronous compute engine beyond the Phase 6 TaskQueue, remote/distributed execution of platform jobs (Phase 12+ device agents), real-time device telemetry.
 ```
 
 On a machine without any Vulkan device (or in a CPU-only build), the program instead prints `Vulkan Virtual GPU is not usable on this system: <reason>`, the automatic Scheduler selection becomes `backend='cpu'` with the real reason in its explanation (`'vulkan' is not usable on this system (...)`), the explicit `'vulkan'` selection is honestly refused with `No fallback was attempted` — never silently rerouted — and the Vulkan benchmark prints an explicit skip line (`Vulkan benchmark skipped: backend not usable on this system (...)`). The monitoring snapshot on such a machine shows the vulkan backend as `unavailable` with its real reason. The standalone `vortyx_bench` tool behaves the same way (`-> SKIP`; no fallback, nothing faked).
@@ -444,8 +467,8 @@ On a machine without any Vulkan device (or in a CPU-only build), the program ins
 
 ```
 Vortyx-GPU/
-├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible)
-├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN option)
+├── .github/workflows/ci.yml        # CI (Windows + Ubuntu, GPU tests where possible, platform-api job)
+├── CMakeLists.txt                  # Root build (VORTYX_ENABLE_VULKAN, VORTYX_ENABLE_PLATFORM options)
 ├── shaders/
 │   ├── vector_add.comp             # Vector addition compute kernel (GLSL source)
 │   ├── vector_multiply.comp        # Phase 10 elementwise multiply kernel
@@ -455,47 +478,56 @@ Vortyx-GPU/
 ├── src/
 │   ├── main.cpp                    # Discovery + Virtual GPU + Queue + Scheduler demo + Phase 8 benchmark/monitoring demo
 │   ├── benchmark_main.cpp          # vortyx_bench: standalone benchmark tool (manual run, not a CI test)
-│   └── core/
-│       ├── version.hpp / logger.*  # Phase 1 utilities
-│       ├── device/                 # Phase 2 Hardware Discovery (unchanged core)
-│       ├── compute/                # Phase 3/4 Compute Runtime
-│       │   ├── task.hpp / .cpp     # VectorAddTask, Status, ComputeResult, validations
-│       │   ├── backend.hpp         # IComputeBackend (buffer-based execution interface)
-│       │   ├── cpu_backend.*       # CPU reference implementation (on host buffers)
-│       │   ├── vulkan_backend.*    # Vulkan compute backend (stub without Vulkan)
-│       │   ├── runtime.*           # Lifecycle + backend selection + task→buffer translation
-│       │   └── vector_add_spv.hpp  # Embedded SPIR-V (generated, committed)
-│       ├── resource/               # Phase 4 Compute Resource & Memory Management
-│       │   ├── resource.hpp/.cpp   # BufferDesc, MemoryLocation, ResourceAccess, size validation
-│       │   ├── backend_buffer.hpp  # IBufferImpl (real storage) + IBufferProvider (factory)
-│       │   ├── buffer.hpp/.cpp     # Buffer move-only RAII handle, BufferResult
-│       │   ├── resource_manager.*  # Registry, providers, stats, shutdown purge
-│       │   ├── cpu_buffer.*        # Host-memory buffer implementation
-│       │   └── vulkan_buffer.*     # VkBuffer + VkDeviceMemory implementation (Vulkan builds)
-│       ├── vgpu/                   # Phase 5 Virtual GPU Interface
-│       │   └── virtual_gpu.hpp/.cpp  # VirtualGpu (logical device), VirtualGpuDesc, State
-│       ├── queue/                  # Phase 6 Task Queue & Async Execution
-│       │   └── task_queue.hpp/.cpp   # TaskQueue (FIFO + 1 worker), QueuedTask, TaskId, TaskState
-│       └── scheduler/              # Phase 7 Basic Scheduler
-│       │   └── scheduler.hpp/.cpp    # Scheduler (selection only), SelectionRequest/Result, pure policy
-│       ├── benchmark/              # Phase 8 Benchmark
-│       │   └── benchmark.hpp/.cpp    # Real-path measurement, BenchmarkConfig/Result, TimingStats, pure statistics
-│       └── monitor/                # Phase 8 Resource Monitoring
-│           └── monitor.hpp/.cpp      # ResourceMonitor (stateless), ResourceSnapshot, honest unavailable markers
+│   ├── core/                       # THE COMPUTE PATH (knows nothing about the platform layer)
+│   │   ├── version.hpp / logger.*  # Phase 1 utilities
+│   │   ├── device/                 # Phase 2 Hardware Discovery (unchanged core)
+│   │   ├── compute/                # Phase 3/4 Compute Runtime
+│   │   │   ├── task.hpp / .cpp     # VectorAddTask, Status, ComputeResult, validations
+│   │   │   ├── backend.hpp         # IComputeBackend (buffer-based execution interface)
+│   │   │   ├── cpu_backend.*       # CPU reference implementation (on host buffers)
+│   │   │   ├── vulkan_backend.*    # Vulkan compute backend (stub without Vulkan)
+│   │   │   ├── runtime.*           # Lifecycle + backend selection + task→buffer translation
+│   │   │   └── vector_add_spv.hpp  # Embedded SPIR-V (generated, committed)
+│   │   ├── resource/               # Phase 4 Compute Resource & Memory Management
+│   │   │   ├── resource.hpp/.cpp   # BufferDesc, MemoryLocation, ResourceAccess, size validation
+│   │   │   ├── backend_buffer.hpp  # IBufferImpl (real storage) + IBufferProvider (factory)
+│   │   │   ├── buffer.hpp/.cpp     # Buffer move-only RAII handle, BufferResult
+│   │   │   ├── resource_manager.*  # Registry, providers, stats, shutdown purge
+│   │   │   ├── cpu_buffer.*        # Host-memory buffer implementation
+│   │   │   └── vulkan_buffer.*     # VkBuffer + VkDeviceMemory implementation (Vulkan builds)
+│   │   ├── vgpu/                   # Phase 5 Virtual GPU Interface
+│   │   │   └── virtual_gpu.hpp/.cpp  # VirtualGpu (logical device), VirtualGpuDesc, State
+│   │   ├── queue/                  # Phase 6 Task Queue & Async Execution
+│   │   │   └── task_queue.hpp/.cpp   # TaskQueue (FIFO + 1 worker), QueuedTask, TaskId, TaskState
+│   │   ├── scheduler/              # Phase 7 Basic Scheduler
+│   │   │   └── scheduler.hpp/.cpp    # Scheduler (selection only), SelectionRequest/Result, pure policy
+│   │   ├── benchmark/              # Phase 8 Benchmark
+│   │   │   └── benchmark.hpp/.cpp    # Real-path measurement, BenchmarkConfig/Result, TimingStats, pure statistics
+│   │   └── monitor/                # Phase 8 Resource Monitoring
+│   │       └── monitor.hpp/.cpp      # ResourceMonitor (stateless), ResourceSnapshot, honest unavailable markers
+│   └── platform/                   # PHASE 11 Platform / Cloud Layer Foundation (separate static lib)
+│       ├── platform.hpp            # Umbrella header + documented layering rules
+│       ├── status.*                # Control-plane result vocabulary (HTTP-mappable)
+│       ├── identity.*              # DeviceId/JobId/UserId + UUID v4 generation (no fingerprints)
+│       ├── metadata.*              # DeviceMetadata + the shared op/backend vocabularies
+│       ├── job.*                   # JobStatus lifecycle, JobEnvelope/ResultEnvelope (metadata only)
+│       ├── auth.*                  # AuthContext + the single ownership rule (RLS mirror)
+│       ├── store.hpp               # IPlatformStore — the provider-neutral seam
+│       ├── memory_store.*          # InMemoryPlatformStore (local/mock reference implementation)
+│       ├── json.*                  # Minimal strict JSON (adapter boundary; no external dependency)
+│       └── contract.*              # API contract codec: request/response/error/status mapping
+├── platform/                       # Cloud platform layer (not part of the CMake build)
+│   ├── api/                        # Vercel-ready API (TypeScript): api/ routes, src/ logic,
+│   │                               #   test/ node:test suite, dev-server.mjs local/mock mode
+│   └── supabase/migrations/        # Real PostgreSQL schema + RLS policies (applied post-Phase-11)
+├── docs/platform/                  # architecture / api contract / database+RLS / security /
+│                                   #   local development / deployment checklist
 └── tests/
+    ├── test_platform.cpp           # Phase 11 platform models + store + authz: must pass everywhere
+    ├── test_platform_contract.cpp  # Phase 11 wire contract (JSON, errors, parsers, serializers)
     ├── test_compute_tasks.cpp     # Phase 10 Compute Engine CPU path: must pass everywhere
     ├── test_compute_tasks_gpu.cpp # Phase 10 Compute Engine GPU path: real tests when Vulkan available
-    ├── test_benchmark.cpp         # Benchmark CPU path: must pass everywhere
-    ├── test_benchmark_gpu.cpp     # Benchmark GPU path: real tests when Vulkan available
-    ├── test_monitor.cpp           # Resource Monitoring CPU path: must pass everywhere
-    ├── test_monitor_gpu.cpp       # Resource Monitoring GPU path: real tests when Vulkan available
-    ├── test_scheduler.cpp         # Basic Scheduler CPU path: must pass everywhere
-    ├── test_scheduler_gpu.cpp     # Basic Scheduler GPU path: real tests when Vulkan available
-    ├── test_taskqueue.cpp         # Task Queue CPU path: must pass everywhere
-    ├── test_taskqueue_gpu.cpp     # Task Queue GPU path: real tests when Vulkan available
-    ├── test_vgpu.cpp              # Virtual GPU CPU path: must pass everywhere
-    ├── test_vgpu_gpu.cpp          # Virtual GPU GPU path: real tests when Vulkan available
-    └── ... (Phase 1/2/3/4 tests unchanged)
+    ├── ... (Phase 1~9 tests unchanged)
 ```
 
 ## Testing
@@ -506,7 +538,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.10.0 |
+| VersionTest | Version constants match 0.11.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -525,6 +557,8 @@ ctest --test-dir build -C Release --output-on-failure
 | BenchmarkGpuTest | When a Vulkan device exists: real Vulkan-path benchmark (backend == 'vulkan', iterations == request, correctness verdict, timing invariants), device info matches the backend's own report (software implementations stay `SoftwareGpu`), bit-exact cross-check against an independent CPU reference execution, repeated benchmark determinism of the verdict, machine-readable export. Without a device: explicit SKIP note (never faked success) |
 | MonitorTest | Monitoring CPU path (every system): system-only snapshot honesty (hardware threads positive when known; Vortyx sections explicitly unobserved, never fake values), full snapshot consistency with the Runtime's own answers (one observation per registered backend, availability/unavailable-reason/DeviceInfo equality, resource stats equality with the manager), shutdown Runtime reported unobserved, value semantics (earlier snapshots unchanged by later system mutations), exact live-buffer tracking across create/release (no leak), repeated snapshots deterministic and non-corrupting, Scheduler selection unchanged by monitoring (identical backend/reason before/after), read-only concurrent snapshots from 4 threads agree, no fabricated metric keys in the export, unavailable backends carry their real reason |
 | MonitorGpuTest | When a Vulkan device exists: the snapshot observes the vulkan backend exactly as the Runtime and the executing Virtual GPU report it (availability, DeviceInfo equality, honest `Gpu`/`SoftwareGpu` kind), real Vulkan execution between snapshots changes no observation except allocation accounting (which returns to zero live buffers — RAII intact). Without a device: explicit SKIP note (never faked success) |
+| PlatformTest | Platform layer CPU path (every system): id syntax + UUID v4 generation/uniqueness, metadata validation (protocol version, capability vocabulary, duplicates, caps), the job status vocabulary + the documented transition table, envelope/result validation (zero-element refusal, failure-requires-reason honesty), the auth boundary (AuthN vs AuthZ, owner/foreign/anonymous), the full `InMemoryPlatformStore` contract — registration with server-managed fields, duplicate conflicts without owner leakage, ownership-filtered lists in insertion order, heartbeats, job idempotency (identical replay returns the existing record; different payload/owner → conflict), foreign/unknown submitting devices Forbidden without existence leaks, lifecycle transitions incl. illegal ones and cancellation, single-outcome result recording with the RLS-equivalence rule (foreign records are NotFound, never Forbidden), and concurrent store use (4 threads × 25 registrations land exactly once; same-id races produce exactly one record) |
+| PlatformContractTest | The wire contract the Vercel API layer mirrors: strict JSON module (full escape/surrogate handling, ~25 malformed-input rejections with reasons, depth cap, byte-stable deterministic serialization, round trips, duplicate-key last-wins), the unified error schema, the HTTP status mapping (400/401/403/404/409/422/500), `store_error_code` vocabulary, request parsers (register device / create job: valid full + minimal bodies, missing fields, wrong types, invalid enums, invalid ids, unsupported protocol versions, unknown-field rejection), response serializers (documented field order, exact values, null for unset timestamps, platform-info vocabulary), and a full local round trip (parse → store → serialize → parse, incl. foreign-read invisibility and idempotent resubmission) |
 
 No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs pass the full suite.
 
@@ -546,7 +580,8 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.7 | Basic Scheduler (deterministic execution-target selection: explicit request or automatic `vulkan` > `cpu` policy) | Implemented |
 | 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | Implemented |
 | 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | Implemented |
-| 0.10 | Compute Engine (generic elementwise ComputeTask layer: VectorAdd / VectorMultiply / VectorScale with bit-exact modular semantics, shared dispatch path, synchronous batch execution, CPU fork-join parallel execution, per-op benchmark capability, Phase 13 partitioning seam documented) | **Implemented (current)** |
+| 0.10 | Compute Engine (generic elementwise ComputeTask layer: VectorAdd / VectorMultiply / VectorScale with bit-exact modular semantics, shared dispatch path, synchronous batch execution, CPU fork-join parallel execution, per-op benchmark capability, Phase 13 partitioning seam documented) | Implemented |
+| 0.11 | Platform / Cloud Layer Foundation (provider-neutral `vortyx::platform` layer: identity/metadata/job contracts, auth boundary with RLS-equivalent ownership, `IPlatformStore` + local/mock store, strict JSON + API contract codec pinned by tests on both sides; Supabase-ready schema + RLS migration; Vercel-ready API structure with local/mock mode; compute core untouched, deployment intentionally deferred) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform | Planned |
 
 ## License

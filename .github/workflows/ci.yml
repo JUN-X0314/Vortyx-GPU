@@ -70,6 +70,29 @@ jobs:
             exit 1
           fi
 
+  # Phase 11: the platform (control-plane) API layer (platform/api) is pure
+  # TypeScript tested with node:test — no npm install, no Supabase, no
+  # secrets, no network (the tests run against the local/mock store). A
+  # separate additive job keeps the C++ jobs above untouched. The layer is
+  # ALSO covered by the C++ jobs: vortyx_platform builds with the core in
+  # every matrix job, and the CPU-only job proves VORTYX_ENABLE_PLATFORM=OFF
+  # still produces the Phase 10 build.
+  platform-api:
+    name: Platform API tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test platform/api (node --test, local/mock store)
+        working-directory: platform/api
+        run: node --test --experimental-strip-types
+
   # Phase 9: the CPU-only build is a core project guarantee ("building and
   # running Vortyx never requires the Vulkan SDK"), so CI verifies it
   # explicitly: no Vulkan SDK/loader, VORTYX_ENABLE_VULKAN=OFF, full test

@@ -126,3 +126,23 @@ add_test(NAME ComputeTasksTest COMMAND test_compute_tasks)
 add_executable(test_compute_tasks_gpu test_compute_tasks_gpu.cpp)
 target_link_libraries(test_compute_tasks_gpu PRIVATE vortyx_core)
 add_test(NAME ComputeTasksGpuTest COMMAND test_compute_tasks_gpu)
+
+# Phase 11: Platform / Cloud Layer Foundation.
+# - Platform tests run on EVERY system: identity/metadata/job models, the
+#   auth boundary (owner vs foreign vs anonymous), the full
+#   InMemoryPlatformStore contract (registration, ownership, idempotency,
+#   lifecycle transitions, results, concurrency). No network, no cloud
+#   account, no secrets — the local/mock store IS the reference
+#   implementation of the control-plane rules.
+# - Contract tests pin the wire contract the Vercel API layer mirrors:
+#   strict JSON, the unified error schema, the HTTP status mapping, request
+#   parsing and response serialization.
+if(VORTYX_ENABLE_PLATFORM)
+    add_executable(test_platform test_platform.cpp)
+    target_link_libraries(test_platform PRIVATE vortyx_platform)
+    add_test(NAME PlatformTest COMMAND test_platform)
+
+    add_executable(test_platform_contract test_platform_contract.cpp)
+    target_link_libraries(test_platform_contract PRIVATE vortyx_platform)
+    add_test(NAME PlatformContractTest COMMAND test_platform_contract)
+endif()
