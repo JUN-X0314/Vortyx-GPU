@@ -22,14 +22,16 @@
 //
 // MEMORY PLANNER (correctness first, by construction):
 //   - Each node output gets a SLOT; slots are REUSED (first-fit by ascending
-//     slot id) when the byte sizes match EXACTLY and the slot's last use is
-//     strictly before the new definition — no same-step read/write aliasing,
-//     no partial-overlap risk (exact size match, no suballocation).
+//     slot id) when the SHAPE, byte size and dtype match EXACTLY and the
+//     slot's last use is strictly before the new definition — no same-step
+//     read/write aliasing, no partial-overlap risk (exact match, no
+//     suballocation). Shape equality is required so a slot's single
+//     allocation serves every definition that reuses it.
 //   - Graph OUTPUT slots are PINNED: their buffers back the returned tensors
 //     and are never reused while the outputs live.
-//   - Reuse requires byte equality, so a reused slot can never overwrite a
-//     differently-sized live tensor, and every execution writes its slot
-//     fully before any read (kernels write whole outputs).
+//   - Reuse requires exact shape/byte/dtype equality, so a reused slot can
+//     never overwrite a differently-shaped live tensor, and every execution
+//     writes its slot fully before any read (kernels write whole outputs).
 //   - The plan reports reuse honestly: slots / unique bytes vs the naive
 //     all-fresh allocation, so tests can pin the counting (and the executor
 //     can verify a planned run matches an unplanned run bit-exactly).
@@ -85,8 +87,9 @@ struct PlanSlot {
     std::int32_t slot_id = 0;      // 0-based, assigned in definition order
     std::int64_t byte_size = 0;
     DataType dtype = DataType::FP32;
-    TensorShape shape;             // the FIRST definition's shape (exact reuse
-                                   // requires equal bytes; shape kept for clarity)
+    TensorShape shape;             // the slot's shape — every definition that
+                                   // reuses the slot shares it (reuse requires
+                                   // exact shape equality, not just bytes)
     NodeId defined_by = kInvalidNodeId;
     bool pinned = false;           // graph output slot — never reused
 };

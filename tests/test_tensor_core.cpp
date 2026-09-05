@@ -404,6 +404,40 @@ int main() {
               "fp64 refused (does not exist)");
         check(parse_tensor_meta("not json", refused, error) == ST::InvalidInput,
               "malformed JSON refused");
+
+        // Phase 13 audit regressions: hostile arithmetic at the metadata
+        // contract boundary must be REFUSED without undefined behavior (both
+        // cases were UBSan-verified failures before the fixes).
+        //
+        // (a) A stride whose reachable offset overflows int64: the layout
+        //     validation computes (dims[d]-1) * stride[d] — the product must
+        //     be checked BEFORE it wraps (signed overflow was UB here).
+        check(parse_tensor_meta("{\"shape\":[3],\"dtype\":\"fp32\",\"layout\":{\"kind\":"
+                                "\"strided\",\"strides\":[4611686018427387904]},"
+                                "\"placement\":{\"location\":\"host\"}}",
+                                refused, error) == ST::InvalidStride,
+              "stride-reach overflow refused (2^62 stride on [3])");
+        //     Direct validate() with the same hostile strides: refused, no UB.
+        TensorLayout hostile;
+        hostile.kind = LayoutKind::Strided;
+        hostile.strides = {std::int64_t{1} << 62};
+        check(hostile.validate(TensorShape::make({3}), std::int64_t{1} << 62, error) ==
+                  ST::InvalidStride,
+              "layout validate refuses the overflowing product directly");
+        // (b) An out-of-int64-range JSON number: the double->int64 cast is
+        //     undefined behavior before the integrality check could reject.
+        check(parse_tensor_meta("{\"shape\":[1e300],\"dtype\":\"fp32\",\"layout\":{\"kind\":"
+                                "\"row_major_contiguous\",\"strides\":[1]},\"placement\":{"
+                                "\"location\":\"host\"}}",
+                                refused, error) == ST::InvalidShape,
+              "out-of-int64-range dimension refused");
+        // (c) The valid boundary stays valid: the largest representable
+        //     stride that fits the storage is accepted.
+        TensorLayout edge;
+        edge.kind = LayoutKind::Strided;
+        edge.strides = {1};
+        check(edge.validate(TensorShape::make({3}), 3, error) == ST::Ok,
+              "in-range strides still validate");
     }
 
     // =====================================================================

@@ -47,6 +47,15 @@ bool parse_int64_array(const vortyx::platform::JsonValue& value,
             return false;
         }
         const double number = item.as_number();
+        // Range-check BEFORE the int64 cast: casting an out-of-range double
+        // to int64 is undefined behavior (float-cast-overflow). The previous
+        // integrality check only noticed the corruption afterwards — the UB
+        // happened first. NaN fails the comparison and is refused too.
+        // (Phase 13 audit hardening; this is the metadata contract boundary.)
+        if (!(number >= -9223372036854775808.0 && number < 9223372036854775808.0)) {
+            error = "array item is out of the signed 64-bit range";
+            return false;
+        }
         if (number != static_cast<double>(static_cast<std::int64_t>(number))) {
             error = "array items must be exact integers";
             return false;

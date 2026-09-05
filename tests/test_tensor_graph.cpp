@@ -308,6 +308,84 @@ int main() {
     }
 
     // =====================================================================
+    // 4b. Planner regression: slot reuse requires SHAPE equality, not just
+    //     equal bytes. (Phase 13 audit: a byte-equal but differently-shaped
+    //     redefinition was planned into the same slot — one allocation, one
+    //     shape — so the first definition's kernel then refused the slot
+    //     tensor at execution: a VALID graph that could never run.)
+    // =====================================================================
+    {
+        // node1 = Reshape(x[2,3] -> [1,6])   (24B fp32)
+        // node2 = Add(a[2,3], b[2,3])        (24B fp32)  -> bytes match,
+        // shapes do not. The add step must NOT reuse the reshape slot.
+        TensorGraph graph;
+        GraphInputDesc x;
+        x.name = "x";
+        x.shape = TensorShape::make({2, 3});
+        x.dtype = DataType::FP32;
+        check(graph.add_input(x, error) == ST::Ok, "4b: x");
+        GraphInputDesc a;
+        a.name = "a";
+        a.shape = TensorShape::make({2, 3});
+        a.dtype = DataType::FP32;
+        check(graph.add_input(a, error) == ST::Ok, "4b: a");
+        GraphInputDesc b;
+        b.name = "b";
+        b.shape = TensorShape::make({2, 3});
+        b.dtype = DataType::FP32;
+        check(graph.add_input(b, error) == ST::Ok, "4b: b");
+
+        NodeId reshape = kInvalidNodeId;
+        NodeId add = kInvalidNodeId;
+        TensorOpParams reshape_params;
+        reshape_params.reshape_target = TensorShape::make({1, 6});
+        check(graph.add_node(TensorOp::Reshape, reshape_params,
+                             {GraphNodeInput{GraphNodeInput::Source::GraphInput, 0}}, reshape,
+                             error) == ST::Ok,
+              "4b: reshape node");
+        check(graph.add_node(TensorOp::Add, TensorOpParams{},
+                             {GraphNodeInput{GraphNodeInput::Source::GraphInput, 1},
+                              GraphNodeInput{GraphNodeInput::Source::GraphInput, 2}},
+                             add, error) == ST::Ok,
+              "4b: add node");
+        check(graph.set_outputs({add}, error) == ST::Ok, "4b: outputs");
+
+        GraphValidation validation;
+        check(validate_graph(graph, validation, error) == ST::Ok, "4b: graph valid");
+
+        GraphExecutionPlan plan;
+        MemoryPlannerConfig config;
+        const TensorCapabilities& caps = executor->backends().front()->capabilities();
+        check(make_execution_plan(graph, validation, caps, config, plan, error) == ST::Ok,
+              "4b: plan built");
+        check(plan.steps[0].output_slot != plan.steps[1].output_slot,
+              "4b: shape-differing steps do NOT share a slot");
+        check(plan.slots.size() == 2 && plan.planned_bytes == plan.naive_bytes,
+              "4b: honest accounting (no reuse across shapes)");
+
+        // And the planned run must actually EXECUTE with correct values.
+        const float xd[6] = {1, 2, 3, 4, 5, 6};
+        const float ad[6] = {10, 20, 30, 40, 50, 60};
+        Tensor tx;
+        Tensor ta;
+        Tensor tb;
+        check(Tensor::from_host(*manager, TensorShape::make({2, 3}), DataType::FP32, xd,
+                                sizeof(xd), tx, error) == ST::Ok, "4b: host x");
+        check(Tensor::from_host(*manager, TensorShape::make({2, 3}), DataType::FP32, ad,
+                                sizeof(ad), ta, error) == ST::Ok, "4b: host a");
+        check(Tensor::from_host(*manager, TensorShape::make({2, 3}), DataType::FP32, ad,
+                                sizeof(ad), tb, error) == ST::Ok, "4b: host b");
+        GraphExecutor graph_executor(*executor);
+        GraphExecutionResult result = graph_executor.execute(graph, plan, {tx, ta, tb});
+        check_status(result.status, ST::Ok, "4b: the valid graph EXECUTES");
+        check(result.outputs.size() == 1 && result.outputs[0].shape() == TensorShape::make({2, 3}),
+              "4b: output shape is the add output");
+        const float expected[6] = {20, 40, 60, 80, 100, 120};
+        check(same_floats(floats(result.outputs[0]), std::vector<float>(expected, expected + 6)),
+              "4b: add output values are exact");
+    }
+
+    // =====================================================================
     // 5. Memory planner reuse: fewer allocations, bit-identical results
     // =====================================================================
     {

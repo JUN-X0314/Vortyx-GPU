@@ -115,10 +115,22 @@ TensorStatus TensorLayout::validate(const TensorShape& shape, std::int64_t stora
         }
     }
     // The maximum reachable offset: sum over dimensions of (dims[d]-1) * stride[d],
-    // skipping broadcast strides (stride 0 contributes nothing). Checked arithmetic.
+    // skipping broadcast strides (stride 0 contributes nothing). CHECKED
+    // ARITHMETIC end to end: the per-dimension product and the running sum
+    // are both overflow-guarded. (Regression: the Phase 13 audit — the
+    // product was previously computed unchecked, so a hostile stride meta
+    // could reach signed-overflow UB here before the refusal below;
+    // UBSan-verified via parse_tensor_meta.)
     std::int64_t max_offset = 0;
     for (std::size_t d = 0; d < shape.rank(); ++d) {
-        const std::int64_t reach = (shape.dims[d] - 1) * strides[d];
+        const std::int64_t span = shape.dims[d] - 1;
+        std::int64_t reach = 0;
+        if (span != 0 && strides[d] != 0) {
+            if (!checked_mul_add(span, strides[d], 0, reach)) {
+                error = "stride offset computation overflows for shape " + shape.describe();
+                return TensorStatus::InvalidStride;
+            }
+        }
         if (reach != 0) {
             const std::int64_t next = max_offset + reach;
             if (max_offset > 0 && reach > 0 && next < max_offset) {
@@ -168,8 +180,17 @@ bool linear_offset(const TensorShape& shape, const TensorLayout& layout,
                     std::to_string(d) + " (" + std::to_string(shape.dims[d]) + " elements)";
             return false;
         }
-        // Checked accumulation: offset += i * stride[d].
-        const std::int64_t contribution = i * layout.strides[d];
+        // Checked accumulation: offset += i * stride[d]. The product itself
+        // is overflow-guarded too (an unchecked i*stride could wrap for
+        // extreme strides even with both factors in range — the same
+        // checked-arithmetic contract the rest of this module documents).
+        std::int64_t contribution = 0;
+        if (i != 0 && layout.strides[d] != 0) {
+            if (!checked_mul_add(i, layout.strides[d], 0, contribution)) {
+                error = "linear offset computation overflows";
+                return false;
+            }
+        }
         if (contribution != 0) {
             if ((contribution > 0 && offset > INT64_MAX - contribution) ||
                 (contribution < 0 && offset < INT64_MIN - contribution)) {

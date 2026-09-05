@@ -153,6 +153,8 @@ TensorStatus make_execution_plan(const TensorGraph& graph, const GraphValidation
     // with it); a slot may back a new definition at step s exactly when
     // last_use[def_step] < s (strictly-after rule — no same-step aliasing).
     struct SlotState {
+        TensorShape shape;     // ALL definitions of this slot share it (reuse
+                               // requires exact shape equality — see below)
         std::int64_t byte_size = 0;
         DataType dtype = DataType::FP32;
         std::size_t def_step = 0;
@@ -179,15 +181,23 @@ TensorStatus make_execution_plan(const TensorGraph& graph, const GraphValidation
         //   - the slot is not pinned (graph outputs outlive the plan),
         //   - its MOST RECENT definition's last READ is strictly before this
         //     step (no same-step read/write aliasing),
-        //   - byte size and dtype match EXACTLY (no partial overlap, no
-        //     reinterpretation).
+        //   - shape, byte size and dtype match EXACTLY (no partial overlap,
+        //     no reinterpretation). Shape equality is REQUIRED, not just byte
+        //     equality: the executor allocates each slot ONCE (with the
+        //     slot's shape) and every producing kernel verifies the provided
+        //     slot tensor against its inferred output shape — a byte-equal
+        //     but differently-shaped redefinition would produce a plan that
+        //     can never execute (regression: the Phase 13 audit repro —
+        //     Reshape[2,3]->[1,6] followed by Add[2,3]+[2,3] planned into one
+        //     slot then failed at execution with InvalidShape).
         std::int32_t assigned = -1;
         if (config.enable_reuse) {
             for (std::size_t i = 0; i < slots.size() && assigned < 0; ++i) {
                 SlotState& candidate = slots[i];
                 if (candidate.pinned) continue;
                 if (last_use[candidate.def_step] >= static_cast<std::int32_t>(s)) continue;
-                if (candidate.byte_size != out_bytes || candidate.dtype != step.output_dtype) {
+                if (candidate.byte_size != out_bytes || candidate.dtype != step.output_dtype ||
+                    !(candidate.shape == step.output_shape)) {
                     continue;
                 }
                 assigned = static_cast<std::int32_t>(i);
@@ -202,6 +212,7 @@ TensorStatus make_execution_plan(const TensorGraph& graph, const GraphValidation
         }
         if (assigned < 0) {
             SlotState fresh;
+            fresh.shape = step.output_shape;
             fresh.byte_size = out_bytes;
             fresh.dtype = step.output_dtype;
             fresh.def_step = s;
@@ -214,12 +225,13 @@ TensorStatus make_execution_plan(const TensorGraph& graph, const GraphValidation
     }
 
     // Materialize the plan's slot table (creation order = slot id order).
+    // With shape-equality reuse, every definition of a slot shares one shape.
     for (const SlotState& state : slots) {
         PlanSlot slot;
         slot.slot_id = static_cast<std::int32_t>(plan.slots.size());
         slot.byte_size = state.byte_size;
         slot.dtype = state.dtype;
-        slot.shape = plan.steps[state.def_step].output_shape;
+        slot.shape = state.shape;
         slot.defined_by = state.definer;
         slot.pinned = state.pinned;
         plan.slots.push_back(std::move(slot));
