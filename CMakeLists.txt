@@ -292,8 +292,12 @@ endif()
 # dependency). Only linked on Windows targets.
 if(WIN32)
     target_link_libraries(vortyx_core PRIVATE dxgi)
-    # The worker's HTTP transport uses Winsock (part of the OS).
-    target_link_libraries(vortyx_worker PUBLIC ws2_32)
+    # The worker's HTTP transport uses Winsock (part of the OS). Guarded by
+    # TARGET: with the worker layer disabled (PLATFORM/DISTRIBUTED=OFF) the
+    # target does not exist and must not be referenced.
+    if(TARGET vortyx_worker)
+        target_link_libraries(vortyx_worker PUBLIC ws2_32)
+    endif()
 endif()
 
 if(VORTYX_HAS_VULKAN_COMPILED)
