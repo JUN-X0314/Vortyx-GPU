@@ -50,6 +50,16 @@
 //     Runtime from scratch (matching Runtime's own re-initialization
 //     behavior tested since Phase 3).
 //
+// Threading (contract, stated explicitly since Phase 9):
+//   A Virtual GPU is NOT thread-safe. execute(), shutdown(), initialize(),
+//   resources() usage and the query methods must be externally serialized;
+//   ONE Virtual GPU must never be executed from two threads at once. The
+//   intended concurrent pattern is layered: hand the Virtual GPU to a
+//   TaskQueue, whose single worker then becomes the only executor while the
+//   queue lives — and shut the queue down before shutting the Virtual GPU
+//   down (Phase 6 ownership contract). The Phase 8 benchmark documents the
+//   same rule from the measurement side.
+//
 // Error handling follows the project-wide result style (Phase 3): no
 // exceptions, explicit Status values with human-readable 'error' strings.
 

@@ -69,3 +69,30 @@ jobs:
             echo "vortyx executable not found"
             exit 1
           fi
+
+  # Phase 9: the CPU-only build is a core project guarantee ("building and
+  # running Vortyx never requires the Vulkan SDK"), so CI verifies it
+  # explicitly: no Vulkan SDK/loader, VORTYX_ENABLE_VULKAN=OFF, full test
+  # suite (GPU tests exit with their honest SKIP note). The GPU-enabled job
+  # above is unchanged and still exercises the real Vulkan backend path.
+  build-cpu-only:
+    name: Build & Test CPU-only (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, Vulkan disabled)
+        shell: bash
+        run: cmake -B build-cpu-only -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_VULKAN=OFF
+
+      - name: Build
+        run: cmake --build build-cpu-only --config Release
+
+      - name: Test
+        run: ctest --test-dir build-cpu-only -C Release --output-on-failure

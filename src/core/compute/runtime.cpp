@@ -275,6 +275,32 @@ ComputeResult Runtime::execute(const vortyx::resource::Buffer& a,
                              "moved-from, released, or runtime shut down)"};
     }
 
+    // Phase 9 stability fix — foreign handles must never reach a backend.
+    // Resource ids are unique PER MANAGER, not globally: a valid handle from
+    // a different Runtime can carry an id that also exists in THIS registry,
+    // so resolving it by id alone would silently bind the WRONG storage and
+    // return Status::Ok for a computation the caller never asked for. Verify
+    // all three handles were created through THIS Runtime's manager first
+    // (the backend contract "foreign buffers are rejected with an error,
+    // never accessed" is enforced here, in exactly one place).
+    const bool foreign_a = !resources_->owns_handle(a);
+    const bool foreign_b = !resources_->owns_handle(b);
+    const bool foreign_c = !resources_->owns_handle(c);
+    if (foreign_a || foreign_b || foreign_c) {
+        std::string which;
+        if (foreign_a) which += "'a'";
+        if (foreign_b) which += std::string(foreign_a ? ", " : "") + "'b'";
+        if (foreign_c) which += std::string((foreign_a || foreign_b) ? ", " : "") + "'c'";
+        const bool multiple = foreign_a + foreign_b + foreign_c > 1;
+        return ComputeResult{
+            Status::InvalidInput,
+            std::string(multiple ? "buffers " : "buffer ") + which +
+                (multiple ? " were" : " was") +
+                " not created through this Runtime's Resource Manager (foreign handles "
+                "are never executed; create all buffers via the same Runtime's "
+                "resources())"};
+    }
+
     // All three buffers must belong to the same backend: vector addition is
     // executed by ONE device. Mixing backends is an explicit error (Phase 4
     // never moves data between devices silently).

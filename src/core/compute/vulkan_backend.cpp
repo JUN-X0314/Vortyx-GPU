@@ -577,11 +577,13 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
 
     VkResult vk = vkResetCommandBuffer(impl->command_buffer, 0);
     if (vk != VK_SUCCESS) {
-        return ComputeResult{Status::BackendError, "Vulkan: vkResetCommandBuffer failed"};
+        return ComputeResult{Status::BackendError,
+                             "Vulkan: vkResetCommandBuffer failed (" + vk_result_name(vk) + ")"};
     }
     vk = vkBeginCommandBuffer(impl->command_buffer, &begin_info);
     if (vk != VK_SUCCESS) {
-        return ComputeResult{Status::BackendError, "Vulkan: vkBeginCommandBuffer failed"};
+        return ComputeResult{Status::BackendError,
+                             "Vulkan: vkBeginCommandBuffer failed (" + vk_result_name(vk) + ")"};
     }
 
     vkCmdBindPipeline(impl->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, impl->pipeline);
@@ -593,7 +595,14 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
 
     const std::uint32_t groups = (count_u32 + kWorkgroupSize - 1) / kWorkgroupSize;
     vkCmdDispatch(impl->command_buffer, groups, 1, 1);
-    vkEndCommandBuffer(impl->command_buffer);
+    // Phase 9 stability: the recorded command buffer must be checked BEFORE
+    // the submit — an unfinished/invalid command buffer would surface later as
+    // a misleading "vkQueueSubmit failed" instead of the real cause.
+    vk = vkEndCommandBuffer(impl->command_buffer);
+    if (vk != VK_SUCCESS) {
+        return ComputeResult{Status::BackendError,
+                             "Vulkan: vkEndCommandBuffer failed (" + vk_result_name(vk) + ")"};
+    }
 
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -602,11 +611,13 @@ ComputeResult VulkanBackend::execute(const vortyx::resource::IBufferImpl& a,
 
     vk = vkQueueSubmit(impl->queue, 1, &submit_info, VK_NULL_HANDLE);
     if (vk != VK_SUCCESS) {
-        return ComputeResult{Status::BackendError, "Vulkan: vkQueueSubmit failed"};
+        return ComputeResult{Status::BackendError,
+                             "Vulkan: vkQueueSubmit failed (" + vk_result_name(vk) + ")"};
     }
     vk = vkQueueWaitIdle(impl->queue);
     if (vk != VK_SUCCESS) {
-        return ComputeResult{Status::BackendError, "Vulkan: vkQueueWaitIdle failed"};
+        return ComputeResult{Status::BackendError,
+                             "Vulkan: vkQueueWaitIdle failed (" + vk_result_name(vk) + ")"};
     }
 
     // The result now lives in the output buffer's device memory; the caller

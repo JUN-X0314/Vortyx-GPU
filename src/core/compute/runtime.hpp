@@ -31,6 +31,17 @@
 // Phase 4 adds NO scheduling: the default backend is "cpu" and device choice
 // is always explicit. Scheduler / Task Queue / Virtual GPU / Multi-GPU are
 // later phases.
+//
+// Threading (contract, unchanged since Phase 4 and now stated explicitly):
+//   A Runtime is NOT thread-safe. All operations on ONE Runtime (initialize,
+//   execute, shutdown, resources() usage, backend/device queries) must be
+//   externally serialized — calling them from several threads at once, or
+//   calling shutdown() while another thread is inside execute(), is a caller
+//   error with undefined behavior. Concurrent execution is a layered concern:
+//   a TaskQueue gives one Virtual GPU (hence one Runtime) a dedicated worker
+//   thread, and then the queue's worker is the ONLY thread that touches it.
+//   Read-only observation of a quiescent Runtime (Phase 8 snapshots) is safe
+//   from several threads at once, as documented in the monitor module.
 
 #include <memory>
 #include <string>

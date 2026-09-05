@@ -122,6 +122,15 @@ const IBufferImpl* ResourceManager::resource(ResourceId id) const {
     return it == resources_.end() ? nullptr : it->second.get();
 }
 
+bool ResourceManager::owns_handle(const Buffer& buffer) const {
+    // A handle carries the weak reference to the ONE manager that created it.
+    // Comparing that manager to this object is exact: it survives id collisions
+    // across managers and cannot be fooled by released handles either (a
+    // released handle keeps its origin manager but is rejected later by the
+    // registry lookup, which returns nullptr for its purged id).
+    return buffer.manager_.lock().get() == this;
+}
+
 ComputeResult ResourceManager::write_resource(ResourceId id, const void* src,
                                               std::size_t bytes) {
     if (shut_down_) {

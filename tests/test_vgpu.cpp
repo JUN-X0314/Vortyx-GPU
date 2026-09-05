@@ -256,6 +256,56 @@ int main() {
               "a released buffer must be rejected with InvalidInput");
     }
 
+    // --- 7b. Buffers of ANOTHER Virtual GPU are rejected (Phase 9) -----------
+    {
+        // Regression test (Phase 9 stability fix): a Virtual GPU documents
+        // that its execute(a, b, c) only runs "live resources of THIS Virtual
+        // GPU". A valid cpu-buffer handle from a SECOND, cpu-configured
+        // Virtual GPU passes the handle/backend pre-checks but must never be
+        // executed here — its id lives in the OTHER Virtual GPU's manager
+        // registry, and resolving it locally could silently bind the wrong
+        // storage. The execution path now verifies ownership explicitly.
+        vortyx::resource::Buffer survivor;
+        {
+            VirtualGpu other_gpu;  // cpu backend (same as cpu_gpu)
+            check(other_gpu.initialize() == Status::Ok, "7b: second Virtual GPU must initialize");
+
+            vortyx::resource::BufferResult oa = other_gpu.resources()->create_buffer(
+                vortyx::resource::BufferDesc::of<std::int32_t>(
+                    4, vortyx::resource::ResourceAccess::Read),
+                other_gpu.backend_name());
+            vortyx::resource::BufferResult ob = other_gpu.resources()->create_buffer(
+                vortyx::resource::BufferDesc::of<std::int32_t>(
+                    4, vortyx::resource::ResourceAccess::Read),
+                other_gpu.backend_name());
+            vortyx::resource::BufferResult oc = other_gpu.resources()->create_buffer(
+                vortyx::resource::BufferDesc::of<std::int32_t>(
+                    4, vortyx::resource::ResourceAccess::Write),
+                other_gpu.backend_name());
+            check(oa.status == Status::Ok && ob.status == Status::Ok && oc.status == Status::Ok,
+                  "7b: foreign Virtual GPU buffers must be created");
+            check(std::string(oa.buffer.backend_name()) == "cpu",
+                  "7b: the foreign buffers must share the configured backend name "
+                  "(so only the ownership check can reject them)");
+
+            const ComputeResult refused = cpu_gpu.execute(oa.buffer, ob.buffer, oc.buffer);
+            check(refused.status == Status::InvalidInput,
+                  std::string("7b: another Virtual GPU's buffers must be rejected with InvalidInput "
+                              "(got ") + vortyx::compute::to_string(refused.status) + ")");
+            check(!refused.error.empty(),
+                  "7b: the rejection must explain the ownership rule");
+
+            // Keep one handle alive past the other Virtual GPU's shutdown to
+            // also cover the outlived-manager case in the same shape.
+            survivor = std::move(oc.buffer);
+            other_gpu.shutdown();
+        }
+        const ComputeResult after_shutdown = cpu_gpu.execute(survivor, survivor, survivor);
+        check(after_shutdown.status == Status::InvalidInput,
+              "7b: a handle whose Virtual GPU is gone must still be rejected cleanly");
+        survivor.reset();
+    }
+
     // --- 8. Known-but-unavailable backend: honest, no silent fallback --------
     // Environment-adaptive but always honest: on machines WITH a usable
     // Vulkan device this exercises real execution; without one it verifies

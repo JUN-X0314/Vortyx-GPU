@@ -85,6 +85,17 @@ public:
     IBufferImpl* resource(ResourceId id);
     const IBufferImpl* resource(ResourceId id) const;
 
+    // True when 'buffer' is a handle that was created through THIS manager.
+    // Resource ids are unique per manager, not globally: a valid handle from
+    // a DIFFERENT manager (another Runtime) can carry an id that also exists
+    // in this registry, so resolving a foreign handle by id alone could bind
+    // the wrong storage. Execution paths verify ownership with this predicate
+    // before resolving handles, so a foreign handle is rejected with an
+    // explicit error instead of being silently executed on (Phase 9 stability
+    // fix, enforcing the "foreign buffers are rejected, never accessed"
+    // backend contract).
+    bool owns_handle(const Buffer& buffer) const;
+
     // Validated host -> buffer transfer (null / zero / oversized rejected).
     ComputeResult write_resource(ResourceId id, const void* src, std::size_t bytes);
 

@@ -6,9 +6,15 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 8 (v0.8.0) — Benchmark + Resource Monitoring
+## Current Phase: Phase 9 (v0.9.0) — Stabilization
 
-Phase 8 adds the **measurement and observation layers**. The Benchmark times the **real compute path** — repeated `VirtualGpu::execute(task)` calls (Virtual GPU → Runtime → Resource Manager → Backend), never a re-implemented calculation — with warmup iterations, configurable measured iterations, min/average/median/max statistics, throughput and a per-iteration correctness verdict. The Resource Monitor returns point-in-time **`ResourceSnapshot`s** of what is honestly observable: system facts, real backend availability, each backend's own device report and the ResourceManager's allocation accounting. Phase 8 is observation only: **no measurement feeds back into the Phase 7 Scheduler**, whose policy stays exactly the fixed availability rule (`vulkan` > `cpu`).
+Phase 9 adds **no new large feature**. It is a full stability audit of the Phase 1~8 codebase — memory safety, lifetime, thread safety, error handling, API consistency, build system, tests, CI, documentation — and ships only the fixes that make the existing implementation more trustworthy:
+
+- **Foreign-buffer handles are now rejected instead of silently mis-executed (stability fix)**: resource ids are unique *per* ResourceManager, not globally. Executing valid `Buffer` handles from a *different* Runtime/Virtual GPU used to resolve them against the executing Runtime's own registry by raw id — if an id collided (easy: every registry starts at 1) and the access layout matched, the execution silently computed on the **wrong buffers** and returned `Status::Ok`, violating the backend contract "foreign buffers are rejected with an error, never accessed". `Runtime::execute(a, b, c)` now verifies ownership of all three handles first (`ResourceManager::owns_handle()`) and fails with a descriptive `Status::InvalidInput`. Covered by regression tests in both `ResourceTest` and `VirtualGpuTest`.
+- **Vulkan execution failures preserve their real cause**: `vkEndCommandBuffer`'s result is now checked before submitting (an invalid command buffer previously surfaced later as a misleading "vkQueueSubmit failed"), and `vkResetCommandBuffer` / `vkBeginCommandBuffer` / `vkEndCommandBuffer` / `vkQueueSubmit` / `vkQueueWaitIdle` failures all report the failing call **with its `VkResult`**.
+- **Lifecycle/threading contracts documented where they were only implied**: `Runtime` and `VirtualGpu` now state their external-serialization contract explicitly (one executor at a time; the TaskQueue worker becomes the only executor while a queue owns the Virtual GPU), and `Buffer::valid()` semantics after `shutdown()` are precise (handle-level check; operations decide liveness).
+- **CI now verifies the CPU-only build explicitly** (new `build-cpu-only` job: Windows + Ubuntu, `VORTYX_ENABLE_VULKAN=OFF`, full test suite) — the "building and running Vortyx never requires the Vulkan SDK" guarantee is now CI-enforced. The GPU-enabled job is unchanged.
+- **Everything else is unchanged**: the Phase 1~8 public APIs, the Scheduler policy (`vulkan` > `cpu`), the TaskQueue shutdown policy, the benchmark measurement semantics and the monitoring truthfulness rules are exactly as delivered in v0.8.0 and verified by the unchanged (plus two regression) test suites.
 
 ```
 Application → Scheduler (select the execution target)
@@ -17,6 +23,10 @@ Application → Scheduler (select the execution target)
 Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples)
 Resource Monitor ── observes the Runtime / Device / allocation state (read-only)
 ```
+
+## Benchmark + Resource Monitoring (Phase 8)
+
+The Phase 8 layers are unchanged in v0.9.0; this section documents what they are.
 
 **Implemented in Phase 8:**
 
@@ -288,27 +298,42 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.8.0
-  Phase:   8 (Benchmark + Resource Monitoring)
+  Version: 0.9.0
+  Phase:   9 (Stabilization)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
+[INFO] GPU discovery ran successfully, found 0 GPU device(s).
 [INFO] Discovered 1 device(s): 1 CPU, 0 GPU.
 [INFO]   Device 0: CPU: Intel(R) Xeon(R) Processor | vendor: Intel | 2 logical processors | 2 physical cores | RAM 3.9 GiB (via linux-procfs)
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
 [INFO] CPU Virtual GPU ready: backend='cpu', state=Ready, device: CPU: Intel(R) Xeon(R) Processor | vendor: Intel | 2 logical processors | 2 physical cores | RAM 3.9 GiB
 [INFO] Virtual GPU (cpu) task execution success: C = A + B (11 22 33 44 55 66 77 88)
 [INFO] Virtual GPU (cpu) resource execution success: C = A + B (11 22 33 44 55 66 77 88)
 [INFO] CPU Virtual GPU resource stats: 0 live buffer(s), 0 live byte(s), 6 total allocation(s).
 [INFO] Virtual GPU shut down.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Virtual GPU initialized (backend: vulkan, state: Ready, device: llvmpipe (LLVM 19.1.7, 256 bits))
 [INFO] Vulkan Virtual GPU ready: backend='vulkan', device: llvmpipe (LLVM 19.1.7, 256 bits) (software/CPU implementation - not a hardware GPU)
+[INFO] Device details: Software GPU: llvmpipe (LLVM 19.1.7, 256 bits) | vendor: Mesa | VRAM 3.9 GiB | id: vulkan-vendor0x10005-device0x0000-api1.4
 [INFO] Virtual GPU (vulkan) task execution success: C = A + B (11 22 33 44 55 66 77 88)
 [INFO] Result verification: Virtual GPU (vulkan) output matches Virtual GPU (cpu) output.
 [INFO] Virtual GPU (vulkan) resource execution success: C = A + B (11 22 33 44 55 66 77 88)
 [INFO] Resource verification: vulkan buffer output matches cpu buffer output.
 [INFO] Virtual GPU shut down.
 [INFO] Post-shutdown execute() refused as expected: NotInitialized - Virtual GPU is shut down (call initialize() again before execute())
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
 [INFO] Task Queue initialized (worker: 1 thread, execution target: 'cpu', FIFO).
 [INFO] Task Queue ready: state=Ready, execution target='cpu', policy: FIFO, worker: 1 thread.
 [INFO] Enqueued task 1 (4 elements, worker executes FIFO in the background).
@@ -323,26 +348,65 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Task Queue shut down (worker joined, all accepted tasks processed).
 [INFO] Queue shut down: state=ShutDown, task states remain queryable until the queue is destroyed.
 [INFO] Virtual GPU shut down.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Scheduler initialized (probe Runtime ready, available backends: vulkan, cpu).
 [INFO] Scheduler selected backend 'vulkan' (automatic policy: 'vulkan' is the highest-priority available backend (priority order: 'vulkan' > 'cpu')).
 [INFO] Automatic selection: backend='vulkan', device: llvmpipe (LLVM 19.1.7, 256 bits)
 [INFO] Selection reason: automatic policy: 'vulkan' is the highest-priority available backend (priority order: 'vulkan' > 'cpu')
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: vulkan, state: Ready, device: llvmpipe (LLVM 19.1.7, 256 bits))
 [INFO] Execution on the selected backend ('vulkan'): C = A + B (11 22 33 44 55 66 77 88)
+[INFO] Virtual GPU shut down.
 [INFO] Scheduler selected backend 'cpu' (explicit request honored: backend 'cpu' is registered and available on this system).
 [INFO] Explicit selection: backend='cpu' (explicit request honored: backend 'cpu' is registered and available on this system)
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
 [INFO] Verification: explicit-cpu execution matches the automatically selected backend's output.
+[INFO] Virtual GPU shut down.
+[INFO] Scheduler selected backend 'vulkan' (explicit request honored: backend 'vulkan' is registered and available on this system).
 [INFO] Explicit selection: backend='vulkan', device: llvmpipe (LLVM 19.1.7, 256 bits)
 [INFO] Scheduler shut down.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Environment observation:
 [INFO] Resource snapshot: hardware threads: 2; backends observed: 2 (2 available)
 [INFO]   backend 'cpu': available, device: Intel(R) Xeon(R) Processor
 [INFO]   backend 'vulkan': available, device: llvmpipe (LLVM 19.1.7, 256 bits)
 [INFO]   resources: 0 live buffer(s), 0 live byte(s), 0 total allocation(s)
-[INFO] Benchmark 'vector_add' on backend 'cpu' (device: Intel(R) Xeon(R) Processor): 8192 elements, 10 measured iterations (1 warmup, excluded): min 3.727 us | avg 3.814 us | median 3.805 us | max 4.048 us | stddev 84 ns | throughput 2.15 Gelem/s | correctness: PASS
-[INFO] Benchmark key=value export: workload=vector_add status=Ok backend=cpu device_type=Cpu device_name=Intel(R) Xeon(R) Processor element_count=8192 warmup_iterations=1 iterations=10 min_ns=3727 average_ns=3814.300 median_ns=3805.000 max_ns=4048 stddev_ns=84.252 throughput_elements_per_second=2147707311.958 correctness_verified=true
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: cpu, state: Ready, device: Intel(R) Xeon(R) Processor)
+[INFO] Benchmark 'vector_add' on 'cpu': 8192 elements x 10 iterations (1 warmup, excluded): avg 3.794 us, correctness verified.
+[INFO] Benchmark 'vector_add' on backend 'cpu' (device: Intel(R) Xeon(R) Processor): 8192 elements, 10 measured iterations (1 warmup, excluded): min 3.708 us | avg 3.794 us | median 3.779 us | max 4.060 us | stddev 95 ns | throughput 2.16 Gelem/s | correctness: PASS
+[INFO] Benchmark key=value export: workload=vector_add status=Ok backend=cpu device_type=Cpu device_name=Intel(R) Xeon(R) Processor element_count=8192 warmup_iterations=1 iterations=10 min_ns=3708 average_ns=3793.600 median_ns=3779.000 max_ns=4060 stddev_ns=95.396 throughput_elements_per_second=2159426402.362 correctness_verified=true
 [INFO] Post-benchmark resource stats: 0 live buffer(s), 0 live byte(s), 33 total allocation(s) (live must be 0: benchmark buffers are RAII).
-[INFO] Benchmark 'vector_add' on backend 'vulkan' (device: llvmpipe (LLVM 19.1.7, 256 bits)): 8192 elements, 10 measured iterations (1 warmup, excluded): min 110.615 us | avg 138.743 us | median 131.511 us | max 178.089 us | stddev 23.100 us | throughput 59.04 Melem/s | correctness: PASS
+[INFO] Virtual GPU shut down.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
+[INFO] Virtual GPU initialized (backend: vulkan, state: Ready, device: llvmpipe (LLVM 19.1.7, 256 bits))
+[INFO] Benchmark 'vector_add' on 'vulkan': 8192 elements x 10 iterations (1 warmup, excluded): avg 150.583 us, correctness verified.
+[INFO] Benchmark 'vector_add' on backend 'vulkan' (device: llvmpipe (LLVM 19.1.7, 256 bits)): 8192 elements, 10 measured iterations (1 warmup, excluded): min 140.741 us | avg 150.583 us | median 147.536 us | max 173.845 us | stddev 9.637 us | throughput 54.40 Melem/s | correctness: PASS
 [INFO] Verification: vulkan benchmark target output matches the host reference (bit-exact).
+[INFO] Virtual GPU shut down.
+[INFO] Vulkan backend ready: physical device 'llvmpipe (LLVM 19.1.7, 256 bits)' (software/CPU implementation, Vulkan API 1.4)
+[INFO] Vulkan buffer resource provider registered (Phase 4 resource layer)
+[INFO] Compute Runtime initialized. Available backends: cpu, vulkan
+[INFO] Resource Manager ready. Buffer providers: cpu, vulkan
 [INFO] Post-benchmark observation: hardware threads: 2, backends available: 2/2.
 [INFO] Hardware discovery: implemented (Phase 2).
 [INFO] Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.
@@ -352,6 +416,7 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 [INFO] Basic Scheduler: implemented (Phase 7) - deterministic execution-target selection (explicit request or automatic vulkan>cpu policy) from real backend availability; selection only, execution stays in the Virtual GPU path.
 [INFO] Benchmark: implemented (Phase 8) - real-path measurement (VirtualGpu::execute end to end) with warmup, repeated iterations, min/average/median/max statistics, throughput and per-iteration correctness verification; measurements only, no performance claims.
 [INFO] Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.
+[INFO] Stabilization: implemented (Phase 9) - full stability audit of Phase 1~8; foreign Resource/Buffer handles from another Runtime are now rejected explicitly instead of being silently resolved by colliding per-manager ids; Vulkan execution failures preserve the failing Vulkan call and its VkResult; Runtime/VirtualGpu threading contracts and Buffer::valid() semantics documented; CI verifies the CPU-only build explicitly.
 [INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler).
 ```
 
@@ -419,14 +484,14 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.8.0 |
+| VersionTest | Version constants match 0.9.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
 | ComputeGpuTest | When a Vulkan device exists: real GPU vector addition, bit-exact CPU-vs-GPU verification, repeated-run determinism, resource cleanup via re-init. Without a device: explicit SKIP note (never faked success) |
-| ResourceTest | Full Buffer lifecycle on the CPU path: creation/info, write/read round-trips (full + partial), oversized/null/zero transfer rejection, zero-element/access/overflow/safety-cap rejection, unknown provider errors, invalid handles, move semantics (copy deleted, exactly-once ownership), RAII leak checks via stats, resource-based vector addition + validation errors (access roles, counts, element size, mixed/invalid handles), shutdown with live resources, handle outliving its Runtime, re-initialization |
+| ResourceTest | Full Buffer lifecycle on the CPU path: creation/info, write/read round-trips (full + partial), oversized/null/zero transfer rejection, zero-element/access/overflow/safety-cap rejection, unknown provider errors, invalid handles, move semantics (copy deleted, exactly-once ownership), RAII leak checks via stats, resource-based vector addition + validation errors (access roles, counts, element size, mixed/invalid handles), shutdown with live resources, handle outliving its Runtime, re-initialization, **foreign handles from another Runtime rejected with colliding ids (Phase 9 regression, both directions, no writes anywhere)** |
 | ResourceGpuTest | When a Vulkan device exists: real `VkBuffer`/`VkDeviceMemory` allocation through the resource layer, `memory_location() == Device` honesty, full create→write→execute→read→release cycles, bit-exact CPU-vs-GPU resource results, oversized-transfer rejection, mixed-backend rejection, shutdown with live GPU buffers, re-initialization. Without a device: explicit SKIP note (never faked success) |
-| VirtualGpuTest | Virtual GPU CPU path (every system): fresh-object state and refused operations, CPU initialization, vector addition vs reference, invalid tasks, unknown-backend early failure + recovery, idempotent re-init / refused reconfiguration, resource-based execution through `resources()`, dead-buffer rejection, honest known-but-unavailable backend behavior (no silent fallback), shutdown/re-init cycles, move semantics (exactly-once ownership, inert moved-from), buffer handles outliving their Virtual GPU |
+| VirtualGpuTest | Virtual GPU CPU path (every system): fresh-object state and refused operations, CPU initialization, vector addition vs reference, invalid tasks, unknown-backend early failure + recovery, idempotent re-init / refused reconfiguration, resource-based execution through `resources()`, dead-buffer rejection, **buffers of another Virtual GPU rejected via ownership verification (Phase 9 regression)**, honest known-but-unavailable backend behavior (no silent fallback), shutdown/re-init cycles, move semantics (exactly-once ownership, inert moved-from), buffer handles outliving their Virtual GPU |
 | VirtualGpuGpuTest | When a Vulkan device exists: real execution through a Vulkan Virtual GPU, bit-exact match against an independently executed CPU Virtual GPU, `Device` memory honesty, cross-backend buffer rejection in both directions, determinism, shutdown with live resources + re-initialization. Without a device: explicit SKIP note (never faked success) |
 | TaskQueueTest | Task Queue CPU path (every system): fresh-object refusals, init with non-Ready Virtual GPU refused, double-init refused, enqueue/wait/result correctness, id uniqueness/monotonicity, deterministic async proof (gated work item: `Running` observable, `enqueue()` non-blocking while the worker is busy, `wait_for` timeout path), FIFO order via order-recording work items, honest failure propagation (custom failing task, Runtime-rejected data, enqueue-time validation, null task), queue on an unavailable backend (adaptive: completes on real Vulkan, fails `BackendUnavailable` without one), shutdown drain policy, enqueue-after-shutdown refusal, records queryable after shutdown, double shutdown, Virtual-GPU-shutdown-first safety, destructor join, concurrent enqueue from 3 threads with distinct results, re-initialization cycles with ids never reused |
 | TaskQueueGpuTest | When a Vulkan device exists: multiple VectorAddTasks queued on a Vulkan Virtual GPU, bit-exact match against independently executed CPU references, FIFO execution order on the GPU queue, determinism, queue-before-gpu shutdown order, enqueue refusal after shutdown. Without a device: explicit SKIP note (never faked success) |
@@ -455,7 +520,8 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.5 | Virtual GPU Interface (logical device over explicit backends) | Implemented |
 | 0.6 | Task Queue and Async Execution (FIFO queue, one worker thread) | Implemented |
 | 0.7 | Basic Scheduler (deterministic execution-target selection: explicit request or automatic `vulkan` > `cpu` policy) | Implemented |
-| 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | **Implemented (current)** |
+| 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | Implemented |
+| 0.9 | Stabilization (full Phase 1~8 audit: foreign-buffer ownership enforcement, Vulkan error-cause preservation, lifecycle/threading contract documentation, CPU-only CI verification, regression tests) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform | Planned |
 
 ## License

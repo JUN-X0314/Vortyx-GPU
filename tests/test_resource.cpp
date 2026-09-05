@@ -500,7 +500,135 @@ int main() {
               "resource-based execution after re-init must work");
     }
 
-    // --- 14. Final accounting: nothing may be left alive ---------------------
+    // --- 14. Foreign handles from ANOTHER Runtime are rejected (Phase 9) -----
+    {
+        // Regression test (Phase 9 stability fix): resource ids are unique
+        // PER MANAGER, not globally. A valid handle from a second Runtime can
+        // carry an id that ALSO EXISTS in this Runtime's registry; execution
+        // used to resolve it against THIS registry and silently compute on
+        // the WRONG buffers with Status::Ok. Foreign handles must fail with
+        // an explicit InvalidInput instead ("foreign buffers are rejected
+        // with an error, never accessed" — backend.hpp contract).
+        Runtime other;
+        check(other.initialize() == Status::Ok, "14: second Runtime must initialize");
+
+        // Local buffers on THIS runtime (whatever the current id counter is).
+        BufferResult la =
+            manager.create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Read), "cpu");
+        BufferResult lb =
+            manager.create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Read), "cpu");
+        BufferResult lc =
+            manager.create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Write), "cpu");
+        check(la.status == Status::Ok && lb.status == Status::Ok && lc.status == Status::Ok,
+              "14: local buffers must be created");
+
+        // Force a REAL id collision: fill the other Runtime's registry until
+        // its next id equals la's id, then create the foreign triple there
+        // with the SAME access layout (so only the ownership check — not the
+        // access-role validation — can catch the misuse below).
+        for (ResourceId filler = 1; filler < la.buffer.id(); ++filler) {
+            BufferResult f = other.resources().create_buffer(
+                BufferDesc::of<std::int32_t>(1, ResourceAccess::Read), "cpu");
+            if (f.status != Status::Ok) {
+                check(false, "14: id-alignment filler creation must succeed");
+                break;
+            }
+        }
+        BufferResult fa =
+            other.resources().create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Read),
+                                            "cpu");
+        BufferResult fb =
+            other.resources().create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Read),
+                                            "cpu");
+        BufferResult fc =
+            other.resources().create_buffer(BufferDesc::of<std::int32_t>(4, ResourceAccess::Write),
+                                            "cpu");
+        check(fa.status == Status::Ok && fb.status == Status::Ok && fc.status == Status::Ok,
+              "14: foreign Runtime buffers must be created");
+        check(fa.buffer.id() == la.buffer.id() && fb.buffer.id() == lb.buffer.id() &&
+                  fc.buffer.id() == lc.buffer.id(),
+              "14: the ids must actually collide for this regression to be exercised");
+        const std::vector<std::int32_t> seven(4, 7);
+        const std::vector<std::int32_t> three(4, 3);
+        check(fa.buffer.write(seven.data(), seven.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: foreign a must be writable through its own manager");
+        check(fb.buffer.write(three.data(), three.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: foreign b must be writable through its own manager");
+
+        // Zero both output buffers explicitly: host buffer storage is
+        // uninitialized memory, so a later "nothing was written" check needs
+        // a defined baseline to compare against.
+        const std::vector<std::int32_t> zeros(4, 0);
+        check(lc.buffer.write(zeros.data(), zeros.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: local output zeroing must succeed");
+        check(fc.buffer.write(zeros.data(), zeros.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: foreign output zeroing must succeed");
+
+        // THE REGRESSION, direction 1: foreign handles whose ids exist in THIS
+        // registry, executed through THIS runtime. Pre-fix this returned
+        // Status::Ok and computed 100+10 into the LOCAL output buffer. Must
+        // now be rejected and must not write anywhere.
+        const std::vector<std::int32_t> hundred(4, 100);
+        const std::vector<std::int32_t> ten(4, 10);
+        check(la.buffer.write(hundred.data(), hundred.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: local a write must succeed");
+        check(lb.buffer.write(ten.data(), ten.size() * sizeof(std::int32_t)).status == Status::Ok,
+              "14: local b write must succeed");
+
+        const ComputeResult foreign_here = runtime.execute(fa.buffer, fb.buffer, fc.buffer);
+        check(foreign_here.status == Status::InvalidInput,
+              "14: foreign handles executed through this Runtime must fail with InvalidInput "
+              "(got " + status_name(foreign_here.status) + ")");
+        check(foreign_here.error.find("not created through this Runtime's Resource Manager") !=
+                  std::string::npos,
+              "14: the rejection must name the ownership rule (error: " +
+                  foreign_here.error + ")");
+
+        // THE REGRESSION, direction 2 (the pre-fix silent-wrong-target case):
+        // local handles (ids colliding with the other runtime's live ids N,
+        // N+1, N+2 holding 7/3/0) executed through the OTHER runtime. The
+        // pre-fix code resolved them to the other runtime's own buffers and
+        // computed 7+3=10 there with Status::Ok. Must be rejected now.
+        const ComputeResult foreign_there = other.execute(la.buffer, lb.buffer, lc.buffer);
+        check(foreign_there.status == Status::InvalidInput,
+              "14: local handles executed through another Runtime must fail with InvalidInput "
+              "(got " + status_name(foreign_there.status) + ")");
+
+        // The refused execution must not have written anywhere.
+        std::vector<std::int32_t> probe(4, -1);
+        check(fc.buffer.read(probe.data(), probe.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: foreign output buffer must still be readable");
+        check(probe == std::vector<std::int32_t>(4, 0),
+              "14: the refused execution must not have written to the foreign output");
+        check(lc.buffer.read(probe.data(), probe.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: local output buffer must still be readable");
+        check(probe == std::vector<std::int32_t>(4, 0),
+              "14: the refused execution must not have written to the local output either");
+
+        // The legitimate path is unchanged: local handles through their own
+        // runtime still compute correctly.
+        const ComputeResult local = runtime.execute(la.buffer, lb.buffer, lc.buffer);
+        check(local.status == Status::Ok,
+              "14: local handles through their own Runtime must still work (error: " +
+                  local.error + ")");
+        std::vector<std::int32_t> result(4, -1);
+        check(lc.buffer.read(result.data(), result.size() * sizeof(std::int32_t)).status ==
+                  Status::Ok,
+              "14: local output read must succeed");
+        check(result == std::vector<std::int32_t>(4, 110),
+              "14: the local execution must produce the real result");
+
+        other.shutdown();
+    }
+
+    // --- 15. Final accounting: nothing may be left alive ---------------------
     runtime.shutdown();
     check(manager.stats().live_buffers == 0, "no buffers may survive full shutdown (no leaks)");
 

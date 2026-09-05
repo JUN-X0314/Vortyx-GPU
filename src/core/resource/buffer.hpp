@@ -58,7 +58,13 @@ public:
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
-    // True while the handle refers to a live resource in a live manager.
+    // Handle-level validity: the handle is non-empty AND its origin manager
+    // object still exists. This is a cheap check that does NOT consult the
+    // registry: after Runtime::shutdown() (the manager object still exists,
+    // but its registry was purged) a handle can still report valid() == true
+    // while every operation on it fails with Status::NotInitialized. Full
+    // liveness is therefore decided by the operations themselves, never by
+    // valid() alone.
     bool valid() const noexcept;
     explicit operator bool() const noexcept { return valid(); }
 
