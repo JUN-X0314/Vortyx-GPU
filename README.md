@@ -6,29 +6,97 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 7 (v0.7.0) — Basic Scheduler
+## Current Phase: Phase 8 (v0.8.0) — Benchmark + Resource Monitoring
 
-Phase 7 adds the first **execution-target selection layer**: the Basic Scheduler answers exactly one question — *which backend should this work run on?* — with a deterministic, explainable decision based on **real backend availability**. It supports explicit backend requests (honored verbatim, never silently remapped) and an automatic policy with a documented fixed priority order. The Scheduler **only selects**; every computation still flows through the unchanged Virtual GPU → Runtime → Resource Manager → Backend path (and the Phase 6 Task Queue keeps its single FIFO worker).
+Phase 8 adds the **measurement and observation layers**. The Benchmark times the **real compute path** — repeated `VirtualGpu::execute(task)` calls (Virtual GPU → Runtime → Resource Manager → Backend), never a re-implemented calculation — with warmup iterations, configurable measured iterations, min/average/median/max statistics, throughput and a per-iteration correctness verdict. The Resource Monitor returns point-in-time **`ResourceSnapshot`s** of what is honestly observable: system facts, real backend availability, each backend's own device report and the ResourceManager's allocation accounting. Phase 8 is observation only: **no measurement feeds back into the Phase 7 Scheduler**, whose policy stays exactly the fixed availability rule (`vulkan` > `cpu`).
 
 ```
 Application → Scheduler (select the execution target)
             → Task Queue → Virtual GPU → Compute Runtime → Resource Manager → Backend → Physical Device
+
+Benchmark    ── measures the Virtual GPU path (end-to-end execute() samples)
+Resource Monitor ── observes the Runtime / Device / allocation state (read-only)
 ```
 
-**Implemented in Phase 7:**
+**Implemented in Phase 8:**
 
-- **`vortyx::scheduler::Scheduler`** (`src/core/scheduler/`): deterministic execution-target selection. `select()` takes a `SelectionRequest` and returns a `SelectionResult` — the chosen canonical backend name, the concrete device behind that choice (`DeviceInfo`, probed live, never fabricated), and a human-readable reason for the decision.
-- **Honest probe source**: the Scheduler owns a private, read-only Compute Runtime and evaluates candidates through its real backend state (`backend_names()` / `has_backend()` / `backend_unavailable_reason()` / `backend_device()`). A compiled-in but unusable backend (Vulkan without a device/driver, or the stub build) is **never** selected as a success.
-- **Explicit requests (no silent fallback)**: `SelectionMode::ExplicitBackend` names one backend. Registered and available → selected. Registered but unavailable → the selection **fails** with that backend's real reason — it is never rerouted to another backend. Unknown names fail listing the registered backends.
-- **Automatic policy (documented, deterministic)**: `SelectionMode::Automatic` walks the fixed priority order `vulkan` > `cpu` (exposed as `Scheduler::automatic_priority()`) and picks the **first candidate that is really available**. Preferring a verified-usable GPU device is this platform's functional purpose — it is not a performance measurement. On systems without a usable Vulkan device the policy deterministically selects `cpu`. The policy itself is a pure function (`basic_scheduler_select`) unit-tested without hardware.
-- **Selection, not execution**: the Scheduler has no execute/task API (verified by a compile-time check in the tests), never touches Vulkan, never touches ResourceManager memory, and does not replace the TaskQueue worker. An application wires the selected backend into `VirtualGpuDesc::backend` and proceeds exactly as in Phase 5/6.
-- **Clean ownership**: the Scheduler owns only its private probe Runtime and holds no reference to any Virtual GPU or Task Queue — the Phase 6 contract (queue shuts down before its Virtual GPU) is untouched, and the Scheduler can be shut down in any order relative to them. Concurrent `select()` calls and `select()`/`shutdown()` races are serialized internally; copying and moving are deleted.
+- **`vortyx::benchmark`** (`src/core/benchmark/`): real-path measurement. `benchmark_vector_add(gpu, task, config)` runs `config.warmup_iterations` warmup calls (verified, excluded from statistics) and `config.iterations` measured calls of `gpu.execute(task)`, each timed with `std::chrono::steady_clock` around exactly one call. The workload is the caller's task — the module never computes anything itself.
+- **Honest measured scope (identical for both backends)**: one sample = one `execute()` end to end — allocation + upload + execution + readback + release — as CPU wall-clock time. The Runtime API does not expose GPU-internal execution boundaries, so no number is ever labeled "GPU time". Setup (initialization, inputs, reference computation, verification) happens outside the timed window.
+- **Correctness before performance**: every iteration's output (warmup AND measured) is verified against a host-computed `C[i] == A[i] + B[i]` reference outside the timed window. A failed or wrong iteration fails the whole benchmark with its real `Status` and the iteration index — successful iterations are never cherry-picked around a failure, and a warmup failure aborts the run (reported as such).
+- **Real statistics with units in the names**: `min`/`max` (exact nanoseconds), `average`/`median`/`stddev` (nanoseconds, deterministic algorithm — median is the mean of the two middle samples for even counts, stddev is the population stddev), `throughput_elements_per_second` — all computed by the pure, unit-tested `compute_timing_stats()`. No unit-less numbers anywhere; `to_key_values()` exports the same values under stable keys (`min_ns`, `average_ns`, …) with no external serialization dependency.
+- **`vortyx::monitor`** (`src/core/monitor/`): stateless snapshot observer. `snapshot(runtime)` reads the Runtime's real backend state (`backend_names()` / `has_backend()` / `backend_unavailable_reason()` / `backend_device()` — the same source of truth the Scheduler probe and every executing Virtual GPU see) plus the ResourceManager's Phase 4 statistics; `snapshot()` (no Runtime) reports only what the standard library can honestly say (`hardware_threads`), everything else explicitly unobserved.
+- **No fake metrics, ever**: a snapshot carries real values and explicit unavailable markers (`std::optional` = nullopt, validity flags) — never a 0 standing in for "unknown". Metrics that do not exist in the current stack (GPU utilization, temperature, power draw, instantaneous CPU utilization, current VRAM usage, fan speed, PCIe bandwidth) have **no field at all**: their absence is the honest representation. The monitor contains no platform-specific code and no second discovery path.
+- **Snapshot value semantics**: `ResourceSnapshot` is a plain value (strings, vectors, DeviceInfo copies) — it stays valid forever after the call, holds no reference into any object, and the monitor owns nothing (no lifecycle, no shutdown, never mutates or retains any Runtime resource).
+- **Scheduler independence**: monitoring and benchmarking are observation only. CPU usage, timings and allocation counts never influence selection — connecting measurements to scheduling is future work that this phase deliberately does not implement.
+- **`vortyx_bench`** (`src/benchmark_main.cpp`): a standalone, manually-run benchmark tool over a workload-size ladder (1K/16K/256K/1M elements — all far below the Phase 4 1 GiB per-buffer safety cap), CPU always and Vulkan when a device exists. Deliberately **not** registered as a CTest test: timing runs do not belong in the pass/fail CI suite; the test suite pins benchmark *invariants* instead.
+
+**Phase 7 (unchanged)**: the Basic Scheduler remains the deterministic execution-target selection layer (explicit requests honored verbatim, automatic `vulkan` > `cpu` policy over real availability); its API, policy and tests are exactly as delivered in v0.7.0. Phase 8 data does not reach it.
 
 **Phase 6 (unchanged)**: the Task Queue remains the asynchronous FIFO execution layer bound to exactly ONE Virtual GPU; its API and tests are exactly as delivered in v0.6.0.
 
 **Phase 5 (unchanged)**: the Virtual GPU remains the single logical compute device per explicitly chosen backend (`"cpu"`, `"vulkan"`), with no automatic selection and no silent fallback inside the Virtual GPU itself; its API and tests are exactly as delivered in v0.5.0.
 
-**Not implemented yet** (later phases): Multi-GPU, load balancing, work stealing, priority scheduling, task graphs, memory pooling / suballocation, network workers, distributed computing, performance-based scheduling (no hardware metrics are consumed — the codebase has none), benchmarks, FPGA/own hardware.
+**Not implemented yet** (later phases): Multi-GPU, load balancing, work stealing, priority scheduling, task graphs, memory pooling / suballocation, network workers, distributed computing, performance-based / resource-aware scheduling (no hardware metrics are consumed — the codebase has none, and Phase 8 deliberately does not connect its measurements to the Scheduler), advanced schedulers of any kind, FPGA/own hardware.
+
+## Benchmark concepts (Phase 8)
+
+| Concept | Meaning |
+|---------|---------|
+| Benchmark | The measurement layer (`vortyx::benchmark`). It measures the real path; it never computes, never allocates device memory of its own, never touches backends |
+| `benchmark_vector_add(gpu, task, config)` | Times `config.warmup_iterations + config.iterations` calls of `gpu.execute(task)` on the CALLER-owned Virtual GPU. The GPU must be Ready and stay alive during the call; the benchmark never initializes, reconfigures, switches or shuts it down |
+| Workload | The caller's `VectorAddTask` — its element count IS the workload size. `BenchmarkConfig` only controls repetition (no separate size field that could disagree with the task) |
+| Warmup | Executed first, verified for correctness, NEVER included in statistics. `0` is allowed. A warmup failure aborts the benchmark (named as the abort point in the error) |
+| Sample | One `steady_clock`-bracketed `execute()` call: allocation + upload + execution + readback + release, end to end, CPU wall-clock. Not "GPU time" — the Runtime does not expose internal boundaries |
+| Statistics | `min`/`max` (exact ns), `average`/`median`/`stddev` (ns, deterministic), `throughput_elements_per_second` — from real samples only; computed by the pure `compute_timing_stats()` (empty samples / zero size refused) |
+| Correctness | Every iteration (warmup + measured) verified against the host reference outside the timed window. Any failure ⇒ failed benchmark with the real Status and iteration index; verdict recorded in `correctness_verified` |
+| Result | `BenchmarkResult`: status + error + backend + `DeviceInfo` + workload/iteration counts + `TimingStats` + verdict. `describe()` renders it for humans; `to_key_values()` exports a stable key=value schema (units in the keys) |
+| Backend honesty | The measured backend is exactly the Virtual GPU's configured one. An unavailable backend ⇒ failed benchmark (`BackendUnavailable`, warmup abort) — the failed result still names THAT backend and is never rerouted to `cpu` |
+| Determinism | Workload, iteration/warmup counts, statistics algorithm, correctness verdict and output schema are deterministic. Timing VALUES are not (they are measurements) |
+
+## Resource Monitoring concepts (Phase 8)
+
+| Concept | Meaning |
+|---------|---------|
+| Resource Monitor | The observation layer (`vortyx::monitor`). Stateless, no lifecycle (a stateless collector gets no fake `initialize()`/`shutdown()`), owns nothing, mutates nothing |
+| `ResourceSnapshot` | One moment's observation, returned BY VALUE (all data copied): system facts + per-backend observations + ResourceManager accounting. Stays valid forever, no dangling references, no mutexes for the caller |
+| `snapshot()` | System-only: `hardware_threads` from the standard library (nullopt when undeterminable). Vortyx sections explicitly unobserved (flags false, no invented values) |
+| `snapshot(runtime)` | Full: system facts + every registered backend's real availability, its own unavailable reason and its own `DeviceInfo`, + the Phase 4 `ResourceStats` (live buffers/bytes, total allocations). Re-queries the Runtime — the same source of truth the Scheduler probe and executing Virtual GPUs use; no second discovery path, no platform-specific code |
+| Unavailable values | Explicitly marked: `std::optional` = nullopt, validity flags = false. NEVER a fake 0 (0 can be a real measurement; "unknown" cannot) |
+| Unsupported metrics | GPU utilization, temperature, power, instantaneous CPU utilization, current VRAM usage, fan speed, PCIe bandwidth: no field exists at all — absence is the honest representation |
+| Scheduler independence | The monitor never feeds the Scheduler. Phase 7 policy stays `vulkan` > `cpu` over availability only; resource-aware scheduling is future work not implemented in Phase 8 |
+
+Example — the Phase 8 application flow (this is what `main.cpp` and the Phase 8 tests exercise):
+
+```cpp
+// --- Observe: a point-in-time snapshot of what is really known ---------
+vortyx::monitor::ResourceMonitor monitor;
+vortyx::compute::Runtime runtime;
+runtime.initialize();
+vortyx::monitor::ResourceSnapshot snap = monitor.snapshot(runtime);
+// snap.hardware_threads, snap.backends[i].available / .device /
+// .unavailable_reason, snap.live_buffers / .live_bytes / .total_allocations
+
+// --- Measure: the REAL execution path, end to end ----------------------
+vortyx::vgpu::VirtualGpu gpu;            // caller owns the execution context
+gpu.initialize();                         // explicit backend ("cpu" default)
+
+vortyx::compute::VectorAddTask task;      // the workload (its size = workload size)
+vortyx::benchmark::BenchmarkConfig config;
+config.iterations = 10;                   // measured iterations (> 0)
+config.warmup_iterations = 1;             // excluded from statistics
+
+vortyx::benchmark::BenchmarkResult r =
+    vortyx::benchmark::benchmark_vector_add(gpu, task, config);
+if (r.status == vortyx::compute::Status::Ok) {
+    // r.timing.min/average_ns/median_ns/max_ns, r.timing.throughput_...
+    // r.correctness_verified == true (every iteration checked)
+}
+std::string human = vortyx::benchmark::describe(r);       // for logs/screens
+auto machine = vortyx::benchmark::to_key_values(r);        // stable key=value
+
+gpu.shutdown();
+runtime.shutdown();                       // monitor owns neither; any order
+```
 
 ## Virtual GPU concepts (Phase 5, unchanged and still in force)
 
@@ -169,6 +237,8 @@ gpu.shutdown();                        // Virtual GPU shuts down AFTER the queue
 | Virtual GPU (Phase 5) | Backend-agnostic logical device over the Runtime (`cpu` / `vulkan`) | same |
 | Task Queue (Phase 6) | FIFO queue + one worker thread over any explicitly chosen Virtual GPU | same |
 | Basic Scheduler (Phase 7) | Execution-target selection (explicit request or automatic `vulkan` > `cpu` policy) from real backend availability | same |
+| Benchmark (Phase 8) | `steady_clock` timing around real `VirtualGpu::execute()` calls (end-to-end samples), warmup + measured iterations, statistics, per-iteration correctness | same |
+| Resource Monitoring (Phase 8) | Point-in-time `ResourceSnapshot` over the Runtime's real backend/device/allocation state (no platform-specific code, no second discovery path) | same |
 
 - DXGI is **discovery-only**; GPU computation goes through the Vulkan backend. The Virtual GPU never touches DXGI or Vulkan.
 - Vulkan was chosen because it is free/open-source, Windows-first friendly, compute-capable without any windowing system, and aligns with the long-term Vortyx roadmap.
@@ -213,13 +283,13 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_VULKAN=OFF
 ctest --test-dir build -C Release
 ```
 
-Example output — **actual devices depend on the machine** (example: Linux box, CPU only, Vulkan provided by the Mesa software implementation):
+Example output — **actual devices and timing numbers depend on the machine; timings below are one real run on the example box and are measurements, not claims** (example: Linux box, CPU only, Vulkan provided by the Mesa software implementation):
 
 ```
 ========================================
   Vortyx GPU
-  Version: 0.7.0
-  Phase:   7 (Basic Scheduler)
+  Version: 0.8.0
+  Phase:   8 (Benchmark + Resource Monitoring)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -263,16 +333,29 @@ Example output — **actual devices depend on the machine** (example: Linux box,
 [INFO] Verification: explicit-cpu execution matches the automatically selected backend's output.
 [INFO] Explicit selection: backend='vulkan', device: llvmpipe (LLVM 19.1.7, 256 bits)
 [INFO] Scheduler shut down.
+[INFO] Environment observation:
+[INFO] Resource snapshot: hardware threads: 2; backends observed: 2 (2 available)
+[INFO]   backend 'cpu': available, device: Intel(R) Xeon(R) Processor
+[INFO]   backend 'vulkan': available, device: llvmpipe (LLVM 19.1.7, 256 bits)
+[INFO]   resources: 0 live buffer(s), 0 live byte(s), 0 total allocation(s)
+[INFO] Benchmark 'vector_add' on backend 'cpu' (device: Intel(R) Xeon(R) Processor): 8192 elements, 10 measured iterations (1 warmup, excluded): min 3.727 us | avg 3.814 us | median 3.805 us | max 4.048 us | stddev 84 ns | throughput 2.15 Gelem/s | correctness: PASS
+[INFO] Benchmark key=value export: workload=vector_add status=Ok backend=cpu device_type=Cpu device_name=Intel(R) Xeon(R) Processor element_count=8192 warmup_iterations=1 iterations=10 min_ns=3727 average_ns=3814.300 median_ns=3805.000 max_ns=4048 stddev_ns=84.252 throughput_elements_per_second=2147707311.958 correctness_verified=true
+[INFO] Post-benchmark resource stats: 0 live buffer(s), 0 live byte(s), 33 total allocation(s) (live must be 0: benchmark buffers are RAII).
+[INFO] Benchmark 'vector_add' on backend 'vulkan' (device: llvmpipe (LLVM 19.1.7, 256 bits)): 8192 elements, 10 measured iterations (1 warmup, excluded): min 110.615 us | avg 138.743 us | median 131.511 us | max 178.089 us | stddev 23.100 us | throughput 59.04 Melem/s | correctness: PASS
+[INFO] Verification: vulkan benchmark target output matches the host reference (bit-exact).
+[INFO] Post-benchmark observation: hardware threads: 2, backends available: 2/2.
 [INFO] Hardware discovery: implemented (Phase 2).
 [INFO] Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.
 [INFO] Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.
 [INFO] Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.
 [INFO] Task Queue: implemented (Phase 6) - FIFO task submission, one worker thread, asynchronous execution, per-task id/state/result, drain-on-shutdown.
 [INFO] Basic Scheduler: implemented (Phase 7) - deterministic execution-target selection (explicit request or automatic vulkan>cpu policy) from real backend availability; selection only, execution stays in the Virtual GPU path.
-[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing.
+[INFO] Benchmark: implemented (Phase 8) - real-path measurement (VirtualGpu::execute end to end) with warmup, repeated iterations, min/average/median/max statistics, throughput and per-iteration correctness verification; measurements only, no performance claims.
+[INFO] Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.
+[INFO] Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler).
 ```
 
-On a machine without any Vulkan device (or in a CPU-only build), the program instead prints `Vulkan Virtual GPU is not usable on this system: <reason>`, the automatic Scheduler selection becomes `backend='cpu'` with the real reason in its explanation (`'vulkan' is not usable on this system (...)`), and the explicit `'vulkan'` selection is honestly refused with `No fallback was attempted` — never silently rerouted.
+On a machine without any Vulkan device (or in a CPU-only build), the program instead prints `Vulkan Virtual GPU is not usable on this system: <reason>`, the automatic Scheduler selection becomes `backend='cpu'` with the real reason in its explanation (`'vulkan' is not usable on this system (...)`), the explicit `'vulkan'` selection is honestly refused with `No fallback was attempted` — never silently rerouted — and the Vulkan benchmark prints an explicit skip line (`Vulkan benchmark skipped: backend not usable on this system (...)`). The monitoring snapshot on such a machine shows the vulkan backend as `unavailable` with its real reason. The standalone `vortyx_bench` tool behaves the same way (`-> SKIP`; no fallback, nothing faked).
 
 ## Project Structure
 
@@ -285,7 +368,8 @@ Vortyx-GPU/
 ├── scripts/
 │   └── embed_spv.py                # Embeds compiled SPIR-V into a C++ header
 ├── src/
-│   ├── main.cpp                    # Discovery + Virtual GPU demo (cpu + vulkan paths)
+│   ├── main.cpp                    # Discovery + Virtual GPU + Queue + Scheduler demo + Phase 8 benchmark/monitoring demo
+│   ├── benchmark_main.cpp          # vortyx_bench: standalone benchmark tool (manual run, not a CI test)
 │   └── core/
 │       ├── version.hpp / logger.*  # Phase 1 utilities
 │       ├── device/                 # Phase 2 Hardware Discovery (unchanged core)
@@ -308,8 +392,16 @@ Vortyx-GPU/
 │       ├── queue/                  # Phase 6 Task Queue & Async Execution
 │       │   └── task_queue.hpp/.cpp   # TaskQueue (FIFO + 1 worker), QueuedTask, TaskId, TaskState
 │       └── scheduler/              # Phase 7 Basic Scheduler
-│           └── scheduler.hpp/.cpp    # Scheduler (selection only), SelectionRequest/Result, pure policy
+│       │   └── scheduler.hpp/.cpp    # Scheduler (selection only), SelectionRequest/Result, pure policy
+│       ├── benchmark/              # Phase 8 Benchmark
+│       │   └── benchmark.hpp/.cpp    # Real-path measurement, BenchmarkConfig/Result, TimingStats, pure statistics
+│       └── monitor/                # Phase 8 Resource Monitoring
+│           └── monitor.hpp/.cpp      # ResourceMonitor (stateless), ResourceSnapshot, honest unavailable markers
 └── tests/
+    ├── test_benchmark.cpp         # Benchmark CPU path: must pass everywhere
+    ├── test_benchmark_gpu.cpp     # Benchmark GPU path: real tests when Vulkan available
+    ├── test_monitor.cpp           # Resource Monitoring CPU path: must pass everywhere
+    ├── test_monitor_gpu.cpp       # Resource Monitoring GPU path: real tests when Vulkan available
     ├── test_scheduler.cpp         # Basic Scheduler CPU path: must pass everywhere
     ├── test_scheduler_gpu.cpp     # Basic Scheduler GPU path: real tests when Vulkan available
     ├── test_taskqueue.cpp         # Task Queue CPU path: must pass everywhere
@@ -327,7 +419,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.7.0 |
+| VersionTest | Version constants match 0.8.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -340,8 +432,18 @@ ctest --test-dir build -C Release --output-on-failure
 | TaskQueueGpuTest | When a Vulkan device exists: multiple VectorAddTasks queued on a Vulkan Virtual GPU, bit-exact match against independently executed CPU references, FIFO execution order on the GPU queue, determinism, queue-before-gpu shutdown order, enqueue refusal after shutdown. Without a device: explicit SKIP note (never faked success) |
 | SchedulerTest | Basic Scheduler CPU path (every system): fresh-object refusals (`select()` before `initialize()` = `NotInitialized`), no-op shutdown, idempotent re-init, documented priority order pinned (`vulkan` > `cpu`), the pure policy over synthetic candidates (explicit available/unavailable/unknown/empty, automatic both-available/skipped-fallback/none-available/empty-list, determinism), adaptive real selections against an independently probed Virtual GPU (automatic matches reality, explicit `cpu` everywhere, explicit `vulkan` honored or honestly refused without remapping), unknown/malformed request refusals (`cuda`, empty explicit name, Automatic-with-backend conflict), selection device == executing Virtual GPU device, shutdown/re-init cycles, TaskQueue integration (selection → Virtual GPU → queue → bit-exact cpu-reference result), concurrent `select()` from 4 threads with consistent results |
 | SchedulerGpuTest | When a Vulkan device exists: the automatic policy must select `vulkan` on the real device, the selection's device matches the executing Virtual GPU's device, explicit `vulkan`/`cpu` requests are honored verbatim, full integration (selection → Virtual GPU → TaskQueue → real GPU vector addition at sizes 4/64/1024/5000, bit-exact vs the cpu reference), repeated-selection determinism, Virtual GPUs keep working after the Scheduler shuts down. Without a device: explicit SKIP note (never faked success) |
+| BenchmarkTest | Benchmark CPU path (every system): zero-iteration / size-mismatch / empty-task config validation, non-Ready Virtual GPU refusal, real-path CPU benchmark (iterations == request, min <= average <= max, median/stddev invariants, real non-zero samples), throughput consistency with element count / average, independent-execution agreement, machine-readable key=value export (backend, min_ns, correctness), human-readable `describe()`, repeated benchmarks (deterministic verdict; timings never compared), zero-warmup policy, honest unavailable-backend handling (adaptive: fails `BackendUnavailable` naming the vulkan target and the warmup abort point on GPU-less systems, succeeds on real devices), the pure statistics algorithm over hand-computed samples (exact min/max/average/median/stddev/throughput, empty/zero-size refusals, single sample, odd/even median), TaskQueue interference check (queue still FIFO-correct after benchmarking another Virtual GPU) |
+| BenchmarkGpuTest | When a Vulkan device exists: real Vulkan-path benchmark (backend == 'vulkan', iterations == request, correctness verdict, timing invariants), device info matches the backend's own report (software implementations stay `SoftwareGpu`), bit-exact cross-check against an independent CPU reference execution, repeated benchmark determinism of the verdict, machine-readable export. Without a device: explicit SKIP note (never faked success) |
+| MonitorTest | Monitoring CPU path (every system): system-only snapshot honesty (hardware threads positive when known; Vortyx sections explicitly unobserved, never fake values), full snapshot consistency with the Runtime's own answers (one observation per registered backend, availability/unavailable-reason/DeviceInfo equality, resource stats equality with the manager), shutdown Runtime reported unobserved, value semantics (earlier snapshots unchanged by later system mutations), exact live-buffer tracking across create/release (no leak), repeated snapshots deterministic and non-corrupting, Scheduler selection unchanged by monitoring (identical backend/reason before/after), read-only concurrent snapshots from 4 threads agree, no fabricated metric keys in the export, unavailable backends carry their real reason |
+| MonitorGpuTest | When a Vulkan device exists: the snapshot observes the vulkan backend exactly as the Runtime and the executing Virtual GPU report it (availability, DeviceInfo equality, honest `Gpu`/`SoftwareGpu` kind), real Vulkan execution between snapshots changes no observation except allocation accounting (which returns to zero live buffers — RAII intact). Without a device: explicit SKIP note (never faked success) |
 
 No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs pass the full suite.
+
+## Benchmark tool (vortyx_bench)
+
+The `vortyx_bench` executable (built alongside `vortyx`, from `src/benchmark_main.cpp`) runs the measurement ladder manually — 1K/16K/256K/1M int32 elements on the CPU backend always and the Vulkan backend when a device is really available, with warmup and per-result correctness verification, printing both the human-readable form and the stable key=value export. It is deliberately **not** part of the CTest suite: the CI verifies benchmark *invariants* (via `BenchmarkTest`/`BenchmarkGpuTest`), not timing numbers, so CI stays fast and flake-free.
+
+Run it yourself when you want actual measurements; treat every number it prints as a measurement of that run on that machine, not as a performance claim. In particular, the measured scope is the end-to-end `execute()` call (allocation + upload + execution + readback + release) for BOTH backends — comparable in scope, but these numbers say nothing about which backend a scheduler "should" choose, and Phase 8 deliberately draws no such conclusion.
 
 ## Roadmap
 
@@ -352,7 +454,8 @@ No test requires a specific GPU vendor or a GPU at all; machines with zero GPUs 
 | 0.4 | Compute Resource & Memory Management (Buffer resources, Resource Manager, RAII ownership) | Implemented |
 | 0.5 | Virtual GPU Interface (logical device over explicit backends) | Implemented |
 | 0.6 | Task Queue and Async Execution (FIFO queue, one worker thread) | Implemented |
-| 0.7 | Basic Scheduler (deterministic execution-target selection: explicit request or automatic `vulkan` > `cpu` policy) | **Implemented (current)** |
+| 0.7 | Basic Scheduler (deterministic execution-target selection: explicit request or automatic `vulkan` > `cpu` policy) | Implemented |
+| 0.8 | Benchmark + Resource Monitoring (real-path measurement with warmup/statistics/correctness; point-in-time resource snapshots over real state) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform | Planned |
 
 ## License

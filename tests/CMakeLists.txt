@@ -83,3 +83,30 @@ add_test(NAME SchedulerTest COMMAND test_scheduler)
 add_executable(test_scheduler_gpu test_scheduler_gpu.cpp)
 target_link_libraries(test_scheduler_gpu PRIVATE vortyx_core)
 add_test(NAME SchedulerGpuTest COMMAND test_scheduler_gpu)
+
+# Phase 8: Benchmark + Resource Monitoring.
+# - Benchmark/monitor CPU tests must pass on every system (including
+#   GPU-less machines and CPU-only builds): config/task validation,
+#   real-path measurement invariants (structural only — never timing
+#   values), correctness verdicts, honest backend handling, the pure
+#   statistics algorithm, snapshot consistency with the Runtime's own
+#   answers, value semantics, Scheduler independence, concurrent read-only
+#   snapshots.
+# - Benchmark/monitor GPU tests run for real when a Vulkan device is
+#   available; on systems without one they exit with an explicit SKIP note
+#   (never a fake success).
+add_executable(test_benchmark test_benchmark.cpp)
+target_link_libraries(test_benchmark PRIVATE vortyx_core)
+add_test(NAME BenchmarkTest COMMAND test_benchmark)
+
+add_executable(test_benchmark_gpu test_benchmark_gpu.cpp)
+target_link_libraries(test_benchmark_gpu PRIVATE vortyx_core)
+add_test(NAME BenchmarkGpuTest COMMAND test_benchmark_gpu)
+
+add_executable(test_monitor test_monitor.cpp)
+target_link_libraries(test_monitor PRIVATE vortyx_core)
+add_test(NAME MonitorTest COMMAND test_monitor)
+
+add_executable(test_monitor_gpu test_monitor_gpu.cpp)
+target_link_libraries(test_monitor_gpu PRIVATE vortyx_core)
+add_test(NAME MonitorGpuTest COMMAND test_monitor_gpu)

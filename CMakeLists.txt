@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.7.0
+    VERSION 0.8.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -72,6 +72,12 @@ add_library(vortyx_core STATIC
 
     # Basic Scheduler (Phase 7)
     src/core/scheduler/scheduler.cpp
+
+    # Benchmark (Phase 8)
+    src/core/benchmark/benchmark.cpp
+
+    # Resource Monitoring (Phase 8)
+    src/core/monitor/monitor.cpp
 )
 target_include_directories(vortyx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -93,6 +99,19 @@ add_executable(vortyx
 target_link_libraries(vortyx PRIVATE vortyx_core)
 # Build configuration (Debug/Release) exposed to the program at compile time.
 target_compile_definitions(vortyx PRIVATE VORTYX_BUILD_CONFIG="$<CONFIG>")
+
+# Benchmark tool (Phase 8): a standalone, manually-run executable that
+# measures the real compute path over a ladder of workload sizes (CPU, and
+# Vulkan when a device is available). It is deliberately NOT registered as a
+# CTest test: timing runs do not belong in the pass/fail CI suite (the
+# Phase 8 test suite pins benchmark INVARIANTS instead, which are fast and
+# deterministic). Build it with the rest of the project; run it when you
+# want actual measurements.
+add_executable(vortyx_bench
+    src/benchmark_main.cpp
+)
+target_link_libraries(vortyx_bench PRIVATE vortyx_core)
+target_compile_definitions(vortyx_bench PRIVATE VORTYX_BUILD_CONFIG="$<CONFIG>")
 
 # Tests
 if(VORTYX_BUILD_TESTS)

@@ -6,6 +6,9 @@
 #include "core/device/discovery.hpp"
 #include "core/device/device.hpp"
 #include "core/compute/task.hpp"
+#include "core/benchmark/benchmark.hpp"
+#include "core/monitor/monitor.hpp"
+#include "core/compute/runtime.hpp"
 #include "core/resource/buffer.hpp"
 #include "core/resource/resource.hpp"
 #include "core/resource/resource_manager.hpp"
@@ -28,6 +31,21 @@ std::string join_values(const std::vector<std::int32_t>& values, std::size_t max
     }
     if (values.size() > limit) out += " ...";
     return out;
+}
+
+// Logs a multi-line text (monitor/benchmark descriptions) one line per log
+// entry so every line keeps its own level prefix.
+void log_multiline(const std::string& text) {
+    std::string line;
+    for (const char character : text) {
+        if (character == '\n') {
+            if (!line.empty()) vortyx::log(vortyx::LogLevel::Info, line);
+            line.clear();
+        } else {
+            line += character;
+        }
+    }
+    if (!line.empty()) vortyx::log(vortyx::LogLevel::Info, line);
 }
 
 // Phase 5: runs one vector addition entirely through the Virtual GPU API,
@@ -127,7 +145,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   7 (Basic Scheduler)" << std::endl;
+    std::cout << "  Phase:   8 (Benchmark + Resource Monitoring)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -513,13 +531,148 @@ int main() {
         scheduler.shutdown();  // shares nothing with the Virtual GPUs above
     }
 
+    // =====================================================================
+    // 5. Benchmark + Resource Monitoring (Phase 8): measure the REAL
+    //    execution path (Virtual GPU -> Runtime -> Resource Manager ->
+    //    Backend) and observe the execution environment. Phase 8 is
+    //    measurement and observation ONLY: nothing here changes the Phase 7
+    //    Scheduler's fixed policy, and no metric is invented — the monitor
+    //    reports exactly what the Runtime's own APIs and the standard
+    //    library can honestly provide, marking everything else unavailable.
+    // =====================================================================
+    {
+        vortyx::monitor::ResourceMonitor monitor;
+
+        // --- 5a. Resource snapshot: what is honestly observable right now
+        {
+            vortyx::compute::Runtime runtime;
+            if (runtime.initialize() == vortyx::compute::Status::Ok) {
+                const vortyx::monitor::ResourceSnapshot snap = monitor.snapshot(runtime);
+                log_multiline("Environment observation:\n" + vortyx::monitor::describe(snap));
+                runtime.shutdown();
+            }
+        }
+
+        // --- 5b. CPU benchmark: real measurements over the real path -----
+        std::vector<std::int32_t> benchmark_reference;
+        {
+            vortyx::vgpu::VirtualGpu gpu;  // explicit cpu backend
+            if (gpu.initialize() != vortyx::compute::Status::Ok) {
+                vortyx::log(vortyx::LogLevel::Error, "CPU Virtual GPU for benchmarking failed to initialize.");
+                return 1;
+            }
+
+            vortyx::compute::VectorAddTask task;
+            const std::size_t count = 8192;
+            task.a.resize(count);
+            task.b.resize(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                task.a[i] = static_cast<std::int32_t>(i % 1000) - 300;
+                task.b[i] = static_cast<std::int32_t>((i * 7) % 500) + 11;
+                benchmark_reference.push_back(task.a[i] + task.b[i]);
+            }
+
+            vortyx::benchmark::BenchmarkConfig config;
+            config.iterations = 10;
+            config.warmup_iterations = 1;
+            const vortyx::benchmark::BenchmarkResult result =
+                vortyx::benchmark::benchmark_vector_add(gpu, task, config);
+
+            log_multiline(vortyx::benchmark::describe(result));
+            if (result.status == vortyx::compute::Status::Ok) {
+                // Machine-readable form of the SAME real numbers (stable
+                // key=value schema; timings carry their unit in the key).
+                std::string flat;
+                for (const auto& pair : vortyx::benchmark::to_key_values(result)) {
+                    if (!flat.empty()) flat += " ";
+                    flat += pair.first + "=" + pair.second;
+                }
+                vortyx::log(vortyx::LogLevel::Info, "Benchmark key=value export: " + flat);
+            }
+
+            // Honest leak observation: the benchmark released everything it
+            // allocated (RAII), so the Virtual GPU's manager holds nothing.
+            const vortyx::resource::ResourceStats stats = gpu.resources()->stats();
+            vortyx::log(vortyx::LogLevel::Info,
+                        "Post-benchmark resource stats: " + std::to_string(stats.live_buffers) +
+                            " live buffer(s), " + std::to_string(stats.live_bytes) +
+                            " live byte(s), " + std::to_string(stats.total_allocations) +
+                            " total allocation(s) (live must be 0: benchmark buffers are RAII).");
+            gpu.shutdown();
+        }
+
+        // --- 5c. Vulkan benchmark: real device only, SKIP otherwise ------
+        {
+            vortyx::vgpu::VirtualGpuDesc desc;
+            desc.backend = "vulkan";
+            vortyx::vgpu::VirtualGpu gpu;
+            gpu.initialize(desc);  // a known backend always initializes
+            if (gpu.backend_available()) {
+                vortyx::compute::VectorAddTask task;
+                const std::size_t count = 8192;
+                task.a.resize(count);
+                task.b.resize(count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    task.a[i] = static_cast<std::int32_t>(i % 1000) - 300;
+                    task.b[i] = static_cast<std::int32_t>((i * 7) % 500) + 11;
+                }
+
+                vortyx::benchmark::BenchmarkConfig config;
+                config.iterations = 10;
+                config.warmup_iterations = 1;
+                const vortyx::benchmark::BenchmarkResult result =
+                    vortyx::benchmark::benchmark_vector_add(gpu, task, config);
+                log_multiline(vortyx::benchmark::describe(result));
+
+                if (result.status == vortyx::compute::Status::Ok) {
+                    // Cross-backend correctness on the SAME task, checked
+                    // against the independently computed reference.
+                    vortyx::compute::VectorAddResult cross = gpu.execute(task);
+                    const bool match = cross.status == vortyx::compute::Status::Ok &&
+                                       cross.data == benchmark_reference;
+                    vortyx::log(vortyx::LogLevel::Info,
+                                match ? "Verification: vulkan benchmark target output matches "
+                                        "the host reference (bit-exact)."
+                                      : "Verification: MISMATCH between vulkan output and the "
+                                        "host reference!");
+                }
+            } else {
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Vulkan benchmark skipped: backend not usable on this system (" +
+                                gpu.backend_unavailable_reason() +
+                                "). No fallback was attempted and nothing was faked.");
+            }
+            gpu.shutdown();
+        }
+
+        // --- 5d. Snapshot after the benchmarks: repeated observation is
+        //        stable and the standalone environment is unchanged.
+        {
+            vortyx::compute::Runtime runtime;
+            if (runtime.initialize() == vortyx::compute::Status::Ok) {
+                const vortyx::monitor::ResourceSnapshot snap = monitor.snapshot(runtime);
+                vortyx::log(vortyx::LogLevel::Info,
+                            "Post-benchmark observation: hardware threads: " +
+                                (snap.hardware_threads.has_value()
+                                     ? std::to_string(*snap.hardware_threads)
+                                     : std::string("unknown")) +
+                                ", backends available: " +
+                                std::to_string(snap.available_backend_count()) + "/" +
+                                std::to_string(snap.backends.size()) + ".");
+                runtime.shutdown();
+            }
+        }
+    }
+
     vortyx::log(vortyx::LogLevel::Info, "Hardware discovery: implemented (Phase 2).");
     vortyx::log(vortyx::LogLevel::Info, "Compute Runtime: implemented (Phase 3) - CPU backend always available, Vulkan GPU backend when a Vulkan device is present.");
     vortyx::log(vortyx::LogLevel::Info, "Compute Resource Manager: implemented (Phase 4) - Buffer resources with explicit host/device memory, upload/download, RAII ownership and safe shutdown.");
     vortyx::log(vortyx::LogLevel::Info, "Virtual GPU: implemented (Phase 5) - one logical compute device per explicitly chosen backend; no automatic backend choice, no silent fallback.");
     vortyx::log(vortyx::LogLevel::Info, "Task Queue: implemented (Phase 6) - FIFO task submission, one worker thread, asynchronous execution, per-task id/state/result, drain-on-shutdown.");
     vortyx::log(vortyx::LogLevel::Info, "Basic Scheduler: implemented (Phase 7) - deterministic execution-target selection (explicit request or automatic vulkan>cpu policy) from real backend availability; selection only, execution stays in the Virtual GPU path.");
-    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing.");
+    vortyx::log(vortyx::LogLevel::Info, "Benchmark: implemented (Phase 8) - real-path measurement (VirtualGpu::execute end to end) with warmup, repeated iterations, min/average/median/max statistics, throughput and per-iteration correctness verification; measurements only, no performance claims.");
+    vortyx::log(vortyx::LogLevel::Info, "Resource Monitoring: implemented (Phase 8) - point-in-time ResourceSnapshots over the Runtime's real backend/device/allocation state; unsupported metrics have no representation instead of fake values; informationally independent of the Scheduler.");
+    vortyx::log(vortyx::LogLevel::Info, "Not implemented yet: Multi-GPU, load balancing, work stealing, priority scheduling, Distributed Computing, Advanced/Resource-Aware Scheduling (benchmark and monitoring data deliberately do NOT influence the Scheduler).");
 
     return 0;
 }
