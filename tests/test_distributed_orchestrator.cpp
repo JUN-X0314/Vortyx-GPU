@@ -238,7 +238,8 @@ struct Cluster {
         return cluster;
     }
 
-    bool add_device(const DeviceId& id, std::int64_t memory_mb, std::int64_t jobs) {
+    bool add_device(const DeviceId& id, std::int64_t memory_mb, std::int64_t jobs,
+                    const std::vector<Op>& ops = {}) {
         if (simulator == nullptr) {
             simulator = std::make_unique<LocalMultiDeviceSimulator>(registry, transport, owner);
         }
@@ -248,6 +249,12 @@ struct Cluster {
         config.capacity.memory_bytes = memory_mb * 1024 * 1024;
         config.capacity.concurrent_jobs = jobs;
         config.max_concurrent_shards = jobs;
+        // An empty list means the default claim (all three ops); a caller
+        // may restrict the claim for capability-mismatch scenarios.
+        config.operations = ops.empty()
+                                ? std::vector<Op>{Op::VectorAdd, Op::VectorMultiply,
+                                                  Op::VectorScale}
+                                : ops;
         bool created = false;
         std::string error;
         return simulator->add_device(config, created, error) == Status::Ok;
@@ -481,13 +488,18 @@ int main() {
 
     // =====================================================================
     // Scenario H: capability mismatch -> rejected
+    // (operation-based, NOT backend-based: a host with a real Vulkan
+    // device makes the simulator honestly claim "vulkan", so a backend
+    // mismatch would be environment-dependent. An operation the device
+    // never claims is refused on every host.)
     // =====================================================================
     {
         std::unique_ptr<Cluster> cluster = Cluster::make();
-        check(cluster->add_device("device-0", 64, 2), "device registers");
+        check(cluster->add_device("device-0", 64, 2,
+                                  {Op::VectorMultiply, Op::VectorScale}),
+              "a device claiming only multiply/scale registers");
 
-        DistributedJobRequest request = make_request("job-h", 100, 1);
-        request.envelope.requested_backend = "vulkan";  // the device claims only cpu
+        DistributedJobRequest request = make_request("job-h", 100, 1);  // vector_add
         DistributedJobRecord job;
         bool created = false;
         check(cluster->orchestrator->submit(cluster->auth, request, job, created) == Status::Ok,

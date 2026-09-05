@@ -557,8 +557,13 @@ int main() {
         std::atomic<int> failed_reservations{0};
         std::vector<std::thread> threads;
         for (int t = 0; t < kThreads; ++t) {
-            threads.emplace_back([&registry, &ok_registrations, &failed_reservations, t]() {
-                const int per_thread = kPerThread;  // local copy captured by value
+            // kPerThread is captured EXPLICITLY by value: a function-local
+            // constexpr referenced inside a lambda without a default
+            // capture mode is the known MSVC C3493 pitfall this project
+            // already hit in Phases 6/11.
+            threads.emplace_back([&registry, &ok_registrations, &failed_reservations, t,
+                                  kPerThread]() {
+                const int per_thread = kPerThread;
                 for (int i = 0; i < per_thread; ++i) {
                     const std::string id = "dev-" + std::to_string(t) + "-" + std::to_string(i);
                     DeviceDescriptor out;
