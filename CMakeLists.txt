@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.13.0
+    VERSION 0.14.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -28,6 +28,13 @@ option(VORTYX_ENABLE_DISTRIBUTED "Build the Vortyx distributed (multi-device) la
 # path — no second memory world). OFF — or PLATFORM/DISTRIBUTED=OFF, which
 # disable it automatically — reproduces the Phase 12 build exactly.
 option(VORTYX_ENABLE_TENSOR "Build the Vortyx tensor (AI/ML acceleration) layer" ON)
+
+# Phase 14: the service layer (Production GPU Platform / Serviceization).
+# Projects, authorization, quota, rate limiting, queue and the job service
+# that wraps the existing platform -> distributed -> tensor stack. OFF — or
+# TENSOR/PLATFORM=OFF, which disable it automatically — reproduces the
+# Phase 13 build exactly.
+option(VORTYX_ENABLE_SERVICE "Build the Vortyx service (platform serviceization) layer" ON)
 
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
@@ -205,6 +212,35 @@ if(VORTYX_ENABLE_TENSOR)
             src/tensor/serialize.cpp              # metadata-only JSON (Phase 11 strict JSON)
         )
         target_link_libraries(vortyx_tensor PUBLIC vortyx_distributed)
+    endif()
+endif()
+
+# Service library (Phase 14): the production-oriented control plane. It
+# WRAPS the existing layers — projects/authz/quota/rate-limit/queue/audit/
+# metrics/health over the Phase 11 store contracts, job dispatch through
+# the UNCHANGED Phase 12 orchestrator. When the tensor layer is OFF —
+# including the automatic DISTRIBUTED/PLATFORM=OFF cases — this layer is
+# OFF with it and the build is exactly Phase 13's.
+if(VORTYX_ENABLE_SERVICE)
+    if(NOT VORTYX_ENABLE_TENSOR)
+        message(STATUS "Vortyx: the tensor layer is OFF - the service layer is disabled with it")
+        set(VORTYX_ENABLE_SERVICE OFF)
+    else()
+        add_library(vortyx_service STATIC
+            src/service/service_status.cpp       # the service result vocabulary
+            src/service/authz.cpp                # the pure role/action table
+            src/service/project.cpp              # projects + memberships (provider-neutral)
+            src/service/quota.cpp                # project quota ledger (exactly-once release)
+            src/service/ratelimit.cpp            # deterministic fixed-window limiter
+            src/service/queue.cpp                # provider-neutral job queue
+            src/service/audit.cpp                # bounded audit events
+            src/service/metrics.cpp              # real counters only
+            src/service/health.cpp               # honest health reporting
+            src/service/artifact.cpp             # artifact metadata registry
+            src/service/platform_service.cpp     # the submission flow + dispatchers
+            src/service/contract_service.cpp     # JSON views (strict platform JSON)
+        )
+        target_link_libraries(vortyx_service PUBLIC vortyx_tensor)
     endif()
 endif()
 

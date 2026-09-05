@@ -217,3 +217,37 @@ if(VORTYX_ENABLE_TENSOR)
     target_link_libraries(test_tensor_distributed PRIVATE vortyx_tensor)
     add_test(NAME TensorDistributedTest COMMAND test_tensor_distributed)
 endif()
+
+# Phase 14: Production GPU Platform / Serviceization.
+# - Service tests run on EVERY system (no GPU, no network, no external
+#   provider): projects/memberships/authorization (including IDOR and
+#   anti-enumeration), the quota ledger (exactly-once release, replay
+#   no-double-charge, concurrency), deterministic rate limiting (FakeClock),
+#   the queue contract, the full submission flow over REAL virtual devices
+#   (2-device sharded execution, cancel races, idempotency, quota
+#   consistency, metrics/audit/health) and the JSON contract.
+if(VORTYX_ENABLE_SERVICE)
+    add_executable(test_service_project test_service_project.cpp)
+    target_link_libraries(test_service_project PRIVATE vortyx_service)
+    add_test(NAME ServiceProjectTest COMMAND test_service_project)
+
+    add_executable(test_service_quota test_service_quota.cpp)
+    target_link_libraries(test_service_quota PRIVATE vortyx_service)
+    add_test(NAME ServiceQuotaTest COMMAND test_service_quota)
+
+    add_executable(test_service_ratelimit test_service_ratelimit.cpp)
+    target_link_libraries(test_service_ratelimit PRIVATE vortyx_service)
+    add_test(NAME ServiceRateLimitTest COMMAND test_service_ratelimit)
+
+    add_executable(test_service_queue test_service_queue.cpp)
+    target_link_libraries(test_service_queue PRIVATE vortyx_service)
+    add_test(NAME ServiceQueueTest COMMAND test_service_queue)
+
+    add_executable(test_service_jobs test_service_jobs.cpp)
+    target_link_libraries(test_service_jobs PRIVATE vortyx_service)
+    add_test(NAME ServiceJobsTest COMMAND test_service_jobs)
+
+    add_executable(test_service_ops test_service_ops.cpp)
+    target_link_libraries(test_service_ops PRIVATE vortyx_service)
+    add_test(NAME ServiceOpsTest COMMAND test_service_ops)
+endif()

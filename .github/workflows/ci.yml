@@ -196,3 +196,30 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-no-tensor -C Release --output-on-failure
+
+  # Phase 14: the service layer is additive ON TOP of the tensor layer;
+  # with VORTYX_ENABLE_SERVICE=OFF the project must build and test exactly
+  # like Phase 13. A separate additive job keeps every existing job
+  # untouched (the matrix jobs above build with the service layer ON by
+  # default, so the service tests run on Windows/Ubuntu/Clang already).
+  build-no-service:
+    name: Build & Test Service=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, service disabled)
+        shell: bash
+        run: cmake -B build-no-service -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_SERVICE=OFF
+
+      - name: Build
+        run: cmake --build build-no-service --config Release
+
+      - name: Test
+        run: ctest --test-dir build-no-service -C Release --output-on-failure
