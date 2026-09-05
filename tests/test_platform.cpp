@@ -609,7 +609,7 @@ int main() {
         {
             std::vector<std::thread> threads;
             for (int t = 0; t < kThreads; ++t) {
-                threads.emplace_back([&store, &alice, t] {
+                threads.emplace_back([&store, &alice, t, kPerThread] {
                     for (int i = 0; i < kPerThread; ++i) {
                         DeviceRecord device;
                         const DeviceId id = "dev-" + std::to_string(t) + "-" + std::to_string(i);
