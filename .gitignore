@@ -82,3 +82,9 @@ node_modules/
 # test output & cache
 Testing/
 .cache/
+
+# Phase 15: real runtime config must never be committed
+platform/web/js/config.js
+platform/api/.env
+platform/api/.env.local
+platform/api/.env.production

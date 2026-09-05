@@ -131,3 +131,57 @@ Properties worth noting:
    relnamespace = 'public'::regnamespace;`
 4. Register two test users; create a device with user A; verify user B's
    `select` on `devices` returns zero rows (RLS in action).
+
+---
+
+## Phase 15 — the service control plane (migration 0003_service_init.sql)
+
+`0003_service_init.sql` is ADDITIVE: it alters nothing from 0001/0002 and
+adds the SERVICE surface's tables. Apply order stays lexicographic:
+0001 → 0002 → 0003.
+
+### Tables and their source-of-truth role
+
+| Table | Source of truth for | Notes |
+|---|---|---|
+| `projects` | projects | owner = creator; `active`/`archived` |
+| `project_members` | membership + roles | exactly one `owner` row per project (trigger-enforced) |
+| `service_jobs` | the service job lifecycle AND the durable queue/lease state | `job_id` PK = the idempotency key; `claimed_by`/`claim_expires_at_ms`/`attempt` live here (no separate queue table) |
+| `quota_policies` | per-project quota POLICY | usage is NOT stored — it derives from in-flight `service_jobs` |
+| `artifact_metadata` | artifact METADATA | no payload column exists; per-project count bounded (trigger) |
+| `audit_events` | the audit trail | metadata only; signup audited by a trigger |
+| `rate_limit_windows` | centralized fixed-window counters | touched only by `vortyx_rate_limit_take` |
+
+### Database-enforced invariants (the API layer ALSO enforces these — defense in depth)
+
+| Invariant | Mechanism |
+|---|---|
+| Quota policy (concurrent jobs / shards / memory) | `vortyx_enforce_service_quota()` BEFORE INSERT trigger — closes the check-then-insert race for concurrent submissions |
+| Single-owner invariant | `vortyx_enforce_single_owner()` trigger on `project_members` — only the creator row may carry `owner`; grants/demotions refused |
+| Artifact metadata bound | `vortyx_enforce_artifact_capacity()` trigger — 256 per project |
+| Atomic worker claim | `vortyx_worker_claim()` RPC — reconcile stale leases + `FOR UPDATE SKIP LOCKED` selection (two workers can never claim one job) |
+| Idempotent result commit | `vortyx_worker_complete()` RPC — duplicate reports return the existing terminal state; foreign/lost claims refused |
+| Centralized rate limiting | `vortyx_rate_limit_take()` RPC — one fixed window per key in the database (per-instance memory would be meaningless across serverless instances) |
+| Stale-lease recovery | `vortyx_worker_reconcile()` — running + expired lease → `failed("worker_lease_expired")` |
+
+### RLS policy map (0003)
+
+| Table | Policy | Mode | Rule |
+|---|---|---|---|
+| projects | `projects_select_member` | SELECT | project-membership EXISTS |
+| projects | `projects_insert_own` / `projects_update_own` | INSERT/UPDATE | `auth.uid() = owner_user_id` |
+| project_members | `project_members_select_member` | SELECT | membership EXISTS |
+| project_members | `project_members_insert_member` / `_delete_member` | INSERT/DELETE | membership EXISTS (the single-owner trigger constrains the shapes) |
+| service_jobs | `service_jobs_select_member` | SELECT | membership EXISTS (foreign projects are INVISIBLE — the RLS mirror of the API's 404) |
+| service_jobs | `service_jobs_insert_member` | INSERT | Member+ role and `auth.uid() = submitted_by` |
+| service_jobs | `service_jobs_update_member` | UPDATE | membership EXISTS |
+| quota_policies | `quota_policies_select_member` / `_write_admin` | SELECT / ALL | membership / Admin+ role |
+| artifact_metadata | `artifact_metadata_select_member` / `_insert_member` / `_delete_member` | SELECT/INSERT/DELETE | membership; insert as creator; delete as creator or Admin+ |
+| audit_events | `audit_events_select_own` | SELECT | `auth.uid() = actor_user_id` |
+| audit_events | `audit_events_select_project_admin` | SELECT | project Admin/Owner membership |
+| audit_events | `audit_events_insert_any_authenticated` | INSERT | the API stamps the actor from the VERIFIED subject |
+| rate_limit_windows | (none — RLS enabled with no policies) | — | deny-all for anon/authenticated; only the security-definer RPC touches it |
+
+The service-role client (used ONLY by the worker-protocol paths and
+reconciliation) bypasses RLS by design; the API never exposes it to a
+browser.

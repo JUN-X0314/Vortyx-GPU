@@ -15,6 +15,7 @@
 
 import { handlePlatformRequest } from "./router.ts";
 import { readConfig, resolvePlatform, type ResolvedPlatform } from "./config.ts";
+import { SOFTWARE_VERSION } from "./version.ts";
 
 export interface ApiRequestLike {
   method?: string;
@@ -49,6 +50,15 @@ function pathOf(rawUrl: string | undefined): string {
   }
 }
 
+function queryOf(rawUrl: string | undefined): Record<string, string> {
+  if (rawUrl === undefined || rawUrl.length === 0) return {};
+  try {
+    return Object.fromEntries(new URL(rawUrl, "http://localhost").searchParams.entries());
+  } catch {
+    return {};
+  }
+}
+
 function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string | undefined {
   const value = headers[name];
   if (value === undefined) return undefined;
@@ -71,12 +81,17 @@ export function createApiHandler(): (req: ApiRequestLike, res: ApiResponseLike) 
         path: pathOf(req.url),
         body: req.body,
         authorization: headerValue(req.headers, "authorization"),
+        query: queryOf(req.url),
       },
       {
         store: resolved.store,
         verifier: resolved.verifier,
         storeKind: resolved.storeKind,
-        softwareVersion: SOFTWARE_VERSION,
+        softwareVersion: resolved.softwareVersion,
+        service: resolved.service,
+        workerToken: resolved.workerToken ?? undefined,
+        reconcileToken: resolved.reconcileToken ?? undefined,
+        allowedOrigin: resolved.allowedOrigin,
       },
     );
     res.status(response.status).json(response.body);
@@ -84,6 +99,5 @@ export function createApiHandler(): (req: ApiRequestLike, res: ApiResponseLike) 
 }
 
 // The API reports the Vortyx version it was built from. Single source of
-// truth on the C++ side is src/core/version.hpp; this constant mirrors it
-// for the /api/platform/info payload (checked consistent in docs).
-const SOFTWARE_VERSION = "0.14.0";
+// truth on the C++ side is src/core/version.hpp; version.ts mirrors it for
+// the /api/platform/info payload (checked consistent in docs).

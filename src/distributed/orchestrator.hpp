@@ -66,6 +66,12 @@
 #include "platform/auth.hpp"
 #include "platform/store.hpp"
 
+// Forward declaration: the trusted cancellation context (ServiceCancellation
+// below) is minted ONLY by the service facade — hence the friendship.
+namespace vortyx::service {
+class PlatformService;
+}
+
 namespace vortyx::distributed {
 
 using vortyx::platform::JobId;  // reused platform identity (see device.hpp)
@@ -74,6 +80,62 @@ using vortyx::platform::UserId;
 // How many times the orchestrator tolerates the cluster changing under a
 // plan before it reports the instability honestly (stale-plan bound).
 inline constexpr std::uint32_t kMaxPlanAttempts = 8;
+
+// ---------------------------------------------------------------------------
+// Privileged cancellation (Phase 15) — the explicit trusted-service contract.
+//
+// Phase 14 discovered a real contract mismatch: the service authorizes
+// project Admins to cancel ANY project job (CancelAnyJob), but this class's
+// owner-only cancel path answers NotFound for a foreign job — so an admin's
+// cancellation of a running job could never reach the executing record.
+// Phase 15 closes that gap WITHOUT impersonation and WITHOUT weakening the
+// ownership rule:
+//
+//   * The ownership path (cancel_job with an AuthContext) is UNCHANGED: a
+//     foreign job is still NotFound, still anti-enumerative.
+//   * The privileged path (cancel_job_privileged) takes a ServiceCancellation
+//     — a context that CANNOT be minted outside the service facade (private
+//     constructor + friendship). The orchestrator performs NO ownership
+//     check on this path: the service has already authorized the action
+//     against the project role table, and the service AUDITS the privileged
+//     action with the acting admin's real identity. The auth.user_id is
+//     never swapped, no owner is impersonated — the trusted authority is an
+//     explicit, auditable, structurally-restricted internal contract.
+// ---------------------------------------------------------------------------
+
+// How a cancellation request treats a job whose orchestrator record is not
+// (yet) visible. The service's dispatcher creates the record as part of
+// submit(); a cancel that arrives inside that record-creation window used
+// to be retried with a sleep-poll loop (Phase 14) — Phase 15 replaces the
+// polling with an explicit intent handoff: the orchestrator records the
+// cancellation INTENT atomically and applies it at record creation (the
+// executing run observes it at its first wave boundary — zero shards
+// dispatch). RefuseUnknown keeps the Phase 12 public contract byte-identical
+// for existing callers (an unknown job stays NotFound).
+enum class CancelDelivery : std::uint8_t {
+    RefuseUnknown,  // unknown job -> NotFound (the Phase 12 contract)
+    RecordIntent,   // unknown job -> intent recorded, reported honestly
+};
+
+// The trusted service-level cancellation context. ONLY the service facade
+// can construct one (private constructor; the facade is a friend). It names
+// the HUMAN actor and the authority they acted under — it is never a
+// substitute identity for any owner.
+class ServiceCancellation {
+public:
+    const UserId& requested_by() const { return requested_by_; }
+    // The stable authority label ("project_admin") — audit vocabulary, not
+    // an identity.
+    const char* authority() const { return authority_; }
+
+private:
+    friend class ::vortyx::service::PlatformService;
+    ServiceCancellation(UserId requested_by, const char* authority)
+        : requested_by_(std::move(requested_by)), authority_(authority) {}
+
+    UserId requested_by_;
+    const char* authority_;
+};
 
 // The submission contract of one distributed job. The control-plane part
 // is the Phase 11 JobEnvelope (reused verbatim — job id, operation,
@@ -202,10 +264,26 @@ public:
     // Owner-initiated cancellation. Non-terminal jobs only (a terminal job
     // is InvalidInput — the Phase 11 rule). Pending/Assigned/Retrying
     // shards are cancelled; in-flight shards finish and are recorded; the
-    // derived status applies. Errors: Unauthenticated | InvalidInput |
+    // derived status applies. 'delivery' selects the record-creation-window
+    // behavior (see CancelDelivery): the default keeps the Phase 12
+    // contract (unknown -> NotFound); the service passes RecordIntent so a
+    // cancellation racing the dispatch handoff is delivered atomically
+    // instead of sleep-polled. Errors: Unauthenticated | InvalidInput |
     // NotFound.
     vortyx::platform::Status cancel_job(const vortyx::platform::AuthContext& auth,
-                                        const JobId& job_id, DistributedJobRecord& out);
+                                        const JobId& job_id, DistributedJobRecord& out,
+                                        CancelDelivery delivery = CancelDelivery::RefuseUnknown);
+
+    // The privileged service-level cancellation (see ServiceCancellation
+    // above): NO ownership check — the caller has already authorized the
+    // action and audits it. Same shard/cancel semantics as cancel_job.
+    // Errors: Unauthenticated ('requested_by' must be a usable id) |
+    // InvalidInput (terminal job) | NotFound (unknown job and
+    // RefuseUnknown).
+    vortyx::platform::Status cancel_job_privileged(const ServiceCancellation& cancellation,
+                                                   const JobId& job_id,
+                                                   DistributedJobRecord& out,
+                                                   CancelDelivery delivery = CancelDelivery::RefuseUnknown);
 
     // The active configuration (observability; never re-parsed implicitly).
     const DistributedConfig& config() const { return config_; }
@@ -271,6 +349,27 @@ private:
     std::unordered_map<JobId, DistributedJobRequest> requests_;  // idempotency + payload
     std::unordered_map<JobId, ResultAggregator> aggregators_;    // per-job aggregation
     std::unordered_map<std::string, DeviceLease> shard_leases_;  // shard_id -> lease
+
+    // Cancellation intents for jobs whose record is not yet visible (the
+    // record-creation window inside submit()). Keyed by job id; the value
+    // is the requesting principal (owner id or the privileged actor —
+    // observability only; delivery itself is unconditional). Consumed
+    // (erased) when a record is created under mutex_, and erased again at
+    // terminal — the map can only ever hold entries for in-flight
+    // submissions, so it is bounded by concurrent dispatches.
+    struct CancelIntent {
+        UserId requested_by;
+        bool privileged = false;
+    };
+    std::unordered_map<JobId, CancelIntent> cancel_intents_;
+
+    // The shared cancellation delivery core: record present -> set the flag
+    // (the caller holds mutex_); record absent -> honor 'delivery'.
+    vortyx::platform::Status deliver_cancellation_locked(const JobId& job_id,
+                                                         const UserId& requested_by,
+                                                         bool privileged,
+                                                         CancelDelivery delivery,
+                                                         DistributedJobRecord& out);
 
     // Guards the jobs table and record state transitions. NEVER held
     // during transport submits or registry calls (lock ordering: the

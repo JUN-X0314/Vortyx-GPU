@@ -37,6 +37,7 @@ const char* to_string(ProjectAction action) {
         case ProjectAction::CancelOwnJob: return "cancel_own_job";
         case ProjectAction::CancelAnyJob: return "cancel_any_job";
         case ProjectAction::RegisterArtifact: return "register_artifact";
+        case ProjectAction::DeleteArtifact: return "delete_artifact";
         case ProjectAction::ManageMembers: return "manage_members";
         case ProjectAction::ChangeQuota: return "change_quota";
         case ProjectAction::ArchiveProject: return "archive_project";
@@ -66,6 +67,7 @@ ServiceStatus authorize_project_action(ProjectRole role, ProjectAction action) {
                        : ServiceStatus::Forbidden;
 
         case ProjectAction::CancelAnyJob:
+        case ProjectAction::DeleteArtifact:
         case ProjectAction::ManageMembers:
         case ProjectAction::ChangeQuota:
             return project_role_at_least(role, ProjectRole::Admin)
@@ -76,6 +78,12 @@ ServiceStatus authorize_project_action(ProjectRole role, ProjectAction action) {
             return role == ProjectRole::Owner ? ServiceStatus::Ok : ServiceStatus::Forbidden;
     }
     return ServiceStatus::Forbidden;
+}
+
+bool project_role_grantable(ProjectRole role) {
+    // The single-owner invariant: ownership is minted exactly once, by
+    // project creation. No add-member path may grant it again.
+    return role != ProjectRole::Owner;
 }
 
 }  // namespace vortyx::service

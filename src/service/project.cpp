@@ -233,6 +233,16 @@ ServiceStatus InMemoryProjectStore::add_member(const vortyx::platform::AuthConte
         ServiceStatus::Ok) {
         return ServiceStatus::Forbidden;
     }
+    // THE SINGLE-OWNER INVARIANT (Phase 15): the Owner role is never
+    // grantable through a membership path. Ownership is minted exactly once
+    // — by project creation — and an ownership transfer does not exist.
+    // The rule is the shared pure function, so the store and the facade
+    // cannot drift.
+    if (!project_role_grantable(role)) {
+        error = "the owner role cannot be granted; a project has exactly one "
+                "owner (its creator)";
+        return ServiceStatus::InvalidInput;
+    }
     for (auto& entry : members_) {
         if (entry.first != project_id) continue;
         for (const ProjectMember& member : entry.second) {

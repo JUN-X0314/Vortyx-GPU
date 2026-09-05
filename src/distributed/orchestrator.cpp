@@ -230,32 +230,86 @@ vortyx::platform::Status DistributedOrchestrator::jobs(const vortyx::platform::A
     return vortyx::platform::Status::Ok;
 }
 
+vortyx::platform::Status DistributedOrchestrator::deliver_cancellation_locked(
+    const JobId& job_id, const UserId& requested_by, bool privileged,
+    CancelDelivery delivery, DistributedJobRecord& out) {
+    // Caller holds mutex_. One core for both cancellation paths: the
+    // ownership path and the privileged trusted-service path differ ONLY in
+    // who was authorized upstream — delivery is identical.
+    for (const std::unique_ptr<DistributedJobRecord>& record : jobs_) {
+        if (record->job_id != job_id) continue;
+        if (distributed_job_status_is_terminal(record->status)) {
+            return vortyx::platform::Status::InvalidInput;
+        }
+        // The cancellation REQUEST: the executing submit observes it at the
+        // next wave/dispatch boundary and drives the shard transitions and
+        // lease releases itself (single-writer rule: the submitting thread
+        // owns the record's shards and leases).
+        record->cancel_requested.store(true, std::memory_order_relaxed);
+        out = *record;
+        return vortyx::platform::Status::Ok;
+    }
+
+    // The record is not visible. Under RefuseUnknown this is the unchanged
+    // Phase 12 contract (an unknown job is NotFound). Under RecordIntent
+    // the cancellation is handed off atomically: submit() applies the
+    // intent when it creates the record (under this same mutex), so no
+    // polling, no sleep, no lost cancellation. The intent entry is bounded
+    // — it exists only between this call and the record's creation (or the
+    // job's terminal transition).
+    if (delivery == CancelDelivery::RefuseUnknown) {
+        return record_not_found();
+    }
+    CancelIntent intent;
+    intent.requested_by = requested_by;
+    intent.privileged = privileged;
+    cancel_intents_[job_id] = std::move(intent);
+    out = DistributedJobRecord();
+    out.job_id = job_id;
+    out.status = DistributedJobStatus::Queued;
+    return vortyx::platform::Status::Ok;
+}
+
 vortyx::platform::Status DistributedOrchestrator::cancel_job(
-    const vortyx::platform::AuthContext& auth, const JobId& job_id, DistributedJobRecord& out) {
+    const vortyx::platform::AuthContext& auth, const JobId& job_id, DistributedJobRecord& out,
+    CancelDelivery delivery) {
     std::string error;
     vortyx::platform::Status status = vortyx::platform::validate_auth(auth, error);
     if (status != vortyx::platform::Status::Ok) return status;
 
     std::lock_guard<std::mutex> lock(mutex_);
     for (const std::unique_ptr<DistributedJobRecord>& record : jobs_) {
-        if (record->job_id == job_id) {
-            if (!vortyx::platform::is_owner(auth, record->owner_user_id)) {
-                return record_not_found();
-            }
-            if (distributed_job_status_is_terminal(record->status)) {
-                error = "job is already terminal";
-                return vortyx::platform::Status::InvalidInput;
-            }
-            // The cancellation REQUEST: the executing submit observes it at
-            // the next wave/dispatch boundary and drives the shard
-            // transitions and lease releases itself (single-writer rule:
-            // the submitting thread owns the record's shards and leases).
-            record->cancel_requested.store(true, std::memory_order_relaxed);
-            out = *record;
-            return vortyx::platform::Status::Ok;
+        if (record->job_id != job_id) continue;
+        // THE OWNERSHIP RULE (unchanged): a foreign job is NotFound —
+        // identical to what the control-plane RLS does (a foreign row is
+        // invisible). Privileged cross-user cancellation goes through
+        // cancel_job_privileged, never through identity swapping.
+        if (!vortyx::platform::is_owner(auth, record->owner_user_id)) {
+            return record_not_found();
         }
+        return deliver_cancellation_locked(job_id, auth.user_id, false, delivery, out);
     }
-    return record_not_found();
+    // Record absent: the intent path still carries the requester (the
+    // dispatcher always submits under the owner's identity, so an intent
+    // delivered at creation lands on the same owner's job).
+    return deliver_cancellation_locked(job_id, auth.user_id, false, delivery, out);
+}
+
+vortyx::platform::Status DistributedOrchestrator::cancel_job_privileged(
+    const ServiceCancellation& cancellation, const JobId& job_id, DistributedJobRecord& out,
+    CancelDelivery delivery) {
+    // The trusted-service contract: the SERVICE authorized this action
+    // (project role table, CancelAnyJob) and audits it with the acting
+    // admin's real identity. The orchestrator performs no ownership check
+    // here — that is the entire point of the explicit privileged path (see
+    // the module header). 'requested_by' must still be a usable id: an
+    // empty actor would make the audit trail meaningless.
+    if (cancellation.requested_by().empty()) {
+        return vortyx::platform::Status::Unauthenticated;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    return deliver_cancellation_locked(job_id, cancellation.requested_by(), true, delivery,
+                                       out);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +387,16 @@ vortyx::platform::Status DistributedOrchestrator::submit(
         record->status = DistributedJobStatus::Queued;
         record->created_at_ms = deps_.clock->now_ms();
         record->platform_status = vortyx::platform::JobStatus::Queued;
+        // Cancellation-intent handoff (Phase 15): a cancel that arrived
+        // during the record-creation window is applied atomically HERE,
+        // under the same mutex that creates the record — the executing run
+        // observes the flag at its first wave boundary and dispatches zero
+        // shards. This replaces the Phase 14 sleep-poll handoff.
+        const auto intent = cancel_intents_.find(request.envelope.job_id);
+        if (intent != cancel_intents_.end()) {
+            record->cancel_requested.store(true, std::memory_order_relaxed);
+            cancel_intents_.erase(intent);
+        }
         jobs_.push_back(std::move(record));
         requests_[request.envelope.job_id] = request;
     }
@@ -367,6 +431,20 @@ vortyx::platform::Status DistributedOrchestrator::submit(
 
 void DistributedOrchestrator::run_job(DistributedJobRecord& job,
                                       const vortyx::platform::AuthContext& auth) {
+    // A cancellation delivered during the record-creation window (the Phase
+    // 15 intent path sets the flag atomically at creation) takes effect
+    // BEFORE any placement or dispatch: zero shards run. The
+    // Queued -> Cancelled transition is the documented table.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (job.cancel_requested.load(std::memory_order_relaxed)) {
+            job.status = DistributedJobStatus::Cancelled;
+            apply_terminal(job);
+            mirror_terminal(auth, job);
+            return;
+        }
+    }
+
     // Queued -> Planning (sharding/placement begins).
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -841,6 +919,10 @@ void DistributedOrchestrator::apply_terminal(DistributedJobRecord& job) {
             job.error = std::to_string(job.result.failed) + " of " +
                         std::to_string(job.result.shard_count) + " shards failed";
         }
+        // The job is terminal: any cancellation intent still attached to it
+        // is obsolete (the terminal state won the race) and is dropped —
+        // the intent map only ever tracks in-flight submissions.
+        cancel_intents_.erase(job.job_id);
     }
 }
 

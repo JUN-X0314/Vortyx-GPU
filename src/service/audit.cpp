@@ -20,6 +20,7 @@ const char* to_string(AuditAction action) {
         case AuditAction::DeviceStateChange: return "device_state_change";
         case AuditAction::ResultAccess: return "result_access";
         case AuditAction::ArtifactRegister: return "artifact_register";
+        case AuditAction::ArtifactDelete: return "artifact_delete";
         case AuditAction::AdminAction: return "admin_action";
     }
     return "unknown";

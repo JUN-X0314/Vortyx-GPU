@@ -6,11 +6,25 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 14 (v0.14.0) — Production GPU Platform / Serviceization
+## Current Phase: Phase 15 (v0.15.0) — Production Platform Integration
 
-Phase 14 adds the **Service Layer** — `vortyx::service` (`src/service/`), a new static library layered ON TOP of the unchanged Phase 13 tensor, Phase 12 distributed and Phase 11 platform layers — turning Vortyx from a compute stack into a **serviceizable platform foundation**: projects with membership roles (`owner` / `admin` / `member` / `viewer`) and ONE pure authorization table shared by every layer; a project quota ledger (concurrent jobs / running shards / reserved memory) with an exactly-once release guarantee and replay-without-double-charge; deterministic fixed-window rate limiting over the injected clock; a provider-neutral bounded FIFO job queue; the full submission flow — authentication → validation → project authorization → rate limit → quota → queue → the **UNCHANGED Phase 12 orchestrator** (dispatched under the submitter's own identity, no privileged path) → terminal finalize; bounded audit events with no field a secret could ride in; metrics that count real events only; honest per-component health (an unattached provider reports `not_configured`, never healthy); an artifact METADATA registry (no payload storage — nothing is faked); and a machine-readable JSON contract in the strict platform JSON subset.
+Phase 15 turns the Phase 1–14 stack into **one product**: the Vortyx Platform. Control plane and execution plane are separate; the boundary between them is the **worker protocol**, and the engine below it is the UNCHANGED Phase 12 distributed stack.
 
-**Honest scope (stated, not buried)**: "production-oriented" means the control plane is real and locally verified end to end — a local cluster of virtual devices, 2-device sharded execution, cancellation races driven by condition variables, concurrent submission storms with a consistent end state. There is NO HTTP server in the C++ core, NO Supabase/Redis/PostgreSQL/cloud-queue adapter (the provider-neutral interfaces are the seams; the in-memory stores are the local/mock references), NO billing, NO GPU marketplace, NO multi-region anything. Each absence is a documented extension point, never a TODO disguised as done. Phase 14's completion criterion: **the service control plane exists, wraps the existing layers without modifying them, and every guarantee above is pinned by real tests.**
+**Service contract fixes (Phase 14's known gaps, closed structurally)**:
+- **Single-owner invariant**: the `Owner` role is never grantable through any membership path (`project_role_grantable` — one pure rule consulted by the store AND the facade; also enforced in the database by a trigger in migration 0003). Ownership is minted exactly once, by project creation; no ownership transfer exists.
+- **Privileged cross-user cancellation**: a project Admin's `CancelAnyJob` actually reaches a RUNNING job now. The service mints a `ServiceCancellation` — a trusted context that CANNOT be constructed outside the service facade (private constructor + friendship) — and the orchestrator's explicit privileged path delivers the cancellation. No identity swapping, no owner impersonation; the action is audited with the acting admin's real identity (`privileged:cancel_any_job`), and the ownership path is unchanged.
+- **No more sleep-polling**: the Phase 14 100×1 ms retry loop in the cancellation path is gone. The orchestrator records a cancellation INTENT atomically when a cancel races the record-creation window; `submit()` applies it at record creation and the job cancels with ZERO shards dispatched. The Phase 12 public contract is unchanged for existing callers (unknown job → `NotFound`).
+- **Bounded artifacts**: the artifact metadata registry holds at most 256 entries per project (capacity refusals are honest `unavailable` outcomes) and supports deletion (creator or Admin+, audited, cross-project references invisible).
+
+**Native execution boundary (`vortyx::worker`, `src/worker/`)**: the `vortyx_worker_agent` process claims queued jobs from the control plane over the worker protocol (claim → lease heartbeat → execute → report; the first heartbeat fires immediately and relays `cancel_requested` into the executing record). Execution is REAL: a local simulated cluster drives the unchanged Phase 12 orchestrator, and the payload is synthesized deterministically from the job id (the honest consequence of the metadata-only control plane — the protocol never carries tensor data). The built-in HTTP/1.1 client speaks plain `http` only (POSIX/Winsock, no TLS in the C++ core — TLS termination is the deployment's reverse proxy's job, documented); an `https` endpoint is refused up front.
+
+**Service control plane (`platform/api`)**: the full API surface — signup/login session verification through Supabase Auth, projects, members, service jobs (submit/list/detail/cancel with pagination caps), quota policy + derived usage, artifacts, audit (own events; project events for Admin+), metrics aggregates — over two persistence providers behind one interface: the fast in-memory store (tests + local dev) and a Supabase/PostgreSQL adapter (production; per-user access-token clients under RLS, service-role client ONLY for the worker paths). Migration `0003_service_init.sql` is additive (0001/0002 untouched) and database-enforces the quota policy (a trigger closes the check-then-insert race), the single-owner invariant, the artifact bound, and an atomic `FOR UPDATE SKIP LOCKED` claim RPC. Stale worker leases are reconciled honestly (`worker_lease_expired` — no automatic re-execution, no fake success).
+
+**Web console (`platform/web`)**: a no-build static SPA (plain ES modules, zero npm dependencies in the browser) — login/signup against Supabase Auth REST directly (publishable anon key only; the service-role key never reaches a browser), dashboard, projects with member/quota/job/artifact/audit tabs, job submit (only the operations the backend really supports), job detail with the real lifecycle and shard summary, devices (registry state; no fabricated telemetry), audit, settings. Loading/empty/error/unauthorized states are explicit; every number comes from the API.
+
+**Verified end to end locally (real commands, real output)**: dev-server + authenticated project creation + job submission + idempotent replay + `vortyx_worker_agent` claiming and executing both jobs through the Phase 12 stack (`completed`, `2/2/0` shards, `result=5000 elements via cpu`) + quota released + cancel path + audit trail + metrics. The same flow is pinned by the C++ (`ServicePhase15Test`, `WorkerTest`) and TypeScript (`service.test.ts`) suites.
+
+**Honest scope (stated, not buried)**: there is still NO billing, NO marketplace, NO multi-region, NO TLS in the C++ worker, NO artifact payload storage (metadata only), NO GPU telemetry anywhere (utilization/VRAM/temperature are never displayed because they are never measured), NO automatic worker provisioning on any cloud, and NO re-execution of stale jobs (recovery marks them failed; a retry is an explicit resubmission). Each absence is a documented extension point, never a TODO disguised as done.
 
 ---
 
@@ -53,6 +67,13 @@ Distributed (Phase 12) ── one cluster of logical devices, orchestrated end t
                             → Workers (LocalWorker → the unchanged Runtime, one per device) → Aggregation
                Transport: IWorkerTransport (in-process loopback only — no network in Phase 12)
                (the compute path still knows NOTHING about any of this)
+
+Worker (Phase 15) ── the native execution boundary (a SEPARATE process)
+            └─ vortyx_worker_agent: claim → lease heartbeat → execute → report
+               INativeExecutor → the UNCHANGED Phase 12 stack (local simulated
+               devices; deterministic payload synthesis from the job id)
+               Transport: HTTP/1.1 worker protocol (plain http; TLS terminates
+               at the deployment's reverse proxy)
 
 Tensor (Phase 13) ── AI/ML tensor workloads, expressed and dispatched by capability
             └─ Tensor (shape · dtype · layout · placement · storage via the Phase 4 resource system)
@@ -316,6 +337,48 @@ gpu.shutdown();                        // Virtual GPU shuts down AFTER the queue
 - Vulkan was chosen because it is free/open-source, Windows-first friendly, compute-capable without any windowing system, and aligns with the long-term Vortyx roadmap.
 - The SPIR-V kernel (`shaders/vector_add.comp`) is **pre-compiled and embedded** into the binary (`src/core/compute/vector_add_spv.hpp`). Building requires no shader compiler, and nothing is downloaded at runtime.
 
+## Platform quickstart (Phase 15)
+
+The platform has three pieces: the **web/API control plane** (`platform/api`, TypeScript), the **web console** (`platform/web`, static), and the **native worker** (`vortyx_worker_agent`, C++). Control plane and execution plane are separate processes talking the worker protocol.
+
+### 1. Build the C++ side (includes the worker)
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j          # builds vortyx_worker_agent too (VORTYX_ENABLE_WORKER=ON by default)
+```
+
+### 2. Local end-to-end (no cloud needed)
+
+```bash
+# Terminal 1 — the control plane (memory mode; local auth scheme Bearer local:<user_id>)
+cd platform/api && VORTYX_WORKER_TOKEN=dev-token node dev-server.mjs   # http://localhost:3000
+
+# Terminal 2 — the native worker (claims queued jobs, executes on the real Phase 12 stack)
+VORTYX_WORKER_ENDPOINT=http://localhost:3000 VORTYX_WORKER_TOKEN=dev-token \
+  ./build/vortyx_worker_agent
+
+# Terminal 3 — submit a job (any HTTP client; the web console does the same calls)
+curl -s -X POST localhost:3000/api/projects \
+  -H "Authorization: Bearer local:me" -d '{"name":"demo"}'
+curl -s -X POST localhost:3000/api/projects/<project_id>/jobs \
+  -H "Authorization: Bearer local:me" \
+  -d '{"job_id":"job-1","operation":"vector_add","element_count":10000,"requested_shard_count":2}'
+curl -s localhost:3000/api/service/jobs/job-1 -H "Authorization: Bearer local:me"
+#   → status "completed", total_shards 2, result_element_count 10000 (REAL Phase 12 execution)
+```
+
+The web console is served by the same dev server at `http://localhost:3000/`. Signing in through the console requires Supabase Auth (see `platform/web/js/config.example.js`); the `local:` bearer scheme above is the documented MOCK shortcut for API development and never reaches a real deployment.
+
+### 3. Production-oriented deployment (Supabase + Vercel + a self-hosted worker)
+
+1. Apply `platform/supabase/migrations/0001` → `0002` → `0003` in order (Supabase SQL editor or `supabase db push`). 0003 creates the service tables, the RLS policies, the quota/single-owner/artifact-capacity triggers and the worker-protocol RPCs.
+2. Deploy `platform/api` as a Vercel project (framework: Other; `VORTYX_STORE=supabase`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` — service-role is used ONLY for the worker paths — plus `VORTYX_WORKER_TOKEN`, `VORTYX_RECONCILE_TOKEN`, `VORTYX_ALLOWED_ORIGIN`).
+3. Deploy `platform/web` as a static Vercel project; fill `js/config.js` with the publishable Supabase URL/anon key and the API origin.
+4. Run `vortyx_worker_agent` on any machine that can reach the API over plain HTTP (inside a trusted network segment, or behind a reverse proxy that terminates TLS — the C++ core deliberately has no TLS; an `https://` endpoint is refused, never silently downgraded).
+
+Details: `docs/worker/local-development.md`, `docs/worker/deployment.md`, `docs/platform/deployment-checklist.md`, `platform/api/.env.example`.
+
 ## Requirements
 
 | Configuration | Build-time | Runtime |
@@ -360,8 +423,8 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.14.0
-  Phase:   13 (AI/ML Acceleration + Tensor Layer)
+  Version: 0.15.0
+  Phase:   15 (Production Platform Integration)
   Build:   Release
 ========================================
 [INFO] Vortyx started.
@@ -578,7 +641,11 @@ Vortyx-GPU/
 ├── platform/                       # Cloud platform layer (not part of the CMake build)
 │   ├── api/                        # Vercel-ready API (TypeScript): api/ routes, src/ logic,
 │   │                               #   test/ node:test suite, dev-server.mjs local/mock mode
-│   └── supabase/migrations/        # Real PostgreSQL schema + RLS policies (applied post-Phase-11)
+│   ├── web/                        # Phase 15 web console: no-build static SPA (plain ES
+│   │                               #   modules; login/signup + dashboard + projects + jobs
+│   │                               #   + devices + audit + settings; Supabase Auth REST)
+│   └── supabase/migrations/        # Real PostgreSQL schema + RLS policies (0001/0002 + the
+│                                   #   Phase 15 service surface in 0003, applied in order)
 ├── docs/platform/                  # architecture / api contract / database+RLS / security /
 │                                   #   local development / deployment checklist
 ├── docs/distributed/               # Phase 12: architecture / device-model / scheduling /
@@ -587,6 +654,8 @@ Vortyx-GPU/
 │                                   #   distributed-integration / local development
 ├── docs/service/                   # Phase 14: architecture / job-lifecycle /
 │                                   #   api contract / local development
+├── docs/worker/                    # Phase 15: the native execution boundary
+│                                   #   (architecture / local development / deployment)
 ├── src/tensor/                     # Phase 13: the tensor layer (vortyx::tensor)
 │   ├── status.*                    # TensorStatus + stable snake_case codes + compute mapping
 │   ├── dtype.*                     # DataType: fp32/fp16/bf16/int32/int8 (closed, named)
@@ -603,6 +672,13 @@ Vortyx-GPU/
 │   ├── graph_executor.*            # Planned graph execution with per-step traces
 │   ├── placement_integration.*     # Phase 12 snapshot → capability-based placement
 │   └── serialize.*                 # Metadata-only JSON (strict Phase 11 module; no payload)
+├── src/worker/                     # Phase 15: the native worker layer (vortyx::worker)
+│   ├── native_executor.*           # INativeExecutor + Phase 12 stack execution + payload synthesis
+│   ├── worker_protocol.*           # The wire contract: claim/heartbeat/complete (strict JSON)
+│   ├── worker_transport.hpp        # IWorkerApiTransport (the HTTP seam)
+│   ├── http_transport.*            # Minimal HTTP/1.1 client (POSIX/Winsock, plain http)
+│   └── worker_agent.*              # The agent loop (claim → execute → report, cancel relay)
+├── src/worker_main.cpp             # vortyx_worker_agent: the executable (env-configured)
 ├── src/service/                    # Phase 14: the service layer (vortyx::service)
 │   ├── service_status.*            # ServiceStatus + stable codes + HTTP mapping
 │   ├── authz.*                     # THE pure (role, action) authorization table
@@ -636,6 +712,8 @@ Vortyx-GPU/
     ├── test_service_queue.cpp      # Phase 14 queue contract (FIFO, idempotent, bounded)
     ├── test_service_jobs.cpp       # Phase 14 the full submission flow e2e + races + storms
     ├── test_service_ops.cpp        # Phase 14 audit/metrics/health/artifacts/JSON contract
+    ├── test_service_phase15.cpp    # Phase 15 privileged cancel / single-owner / bounded artifacts / intent delivery
+    ├── test_worker.cpp             # Phase 15 synthesis determinism / protocol codec / agent loop / real e2e execution
     ├── test_compute_tasks.cpp     # Phase 10 Compute Engine CPU path: must pass everywhere
     ├── test_compute_tasks_gpu.cpp # Phase 10 Compute Engine GPU path: real tests when Vulkan available
     ├── ... (Phase 1~9 tests unchanged)
@@ -673,6 +751,8 @@ ctest --test-dir build -C Release --output-on-failure
 | DistributedTest | Distributed foundation (every system, no GPU): the device state machine (every documented transition + key refusals: no silent revival from Offline/Failed, no self-transitions), schedulability vocabulary, capability validation against the Phase 11 metadata rules + claims-only matching (empty claims support nothing, unknown backend/op refused, preferred backend derivation), ResourceVector invariants (validity, fit at the exact boundary, add/sub with zero clamp, per-op honest shard memory with overflow refusal, stable debug string), the registry (fresh Registering/Unknown honesty, idempotent identical re-registration with liveness/activation semantics, owner/payload conflicts without owner leakage, foreign invisibility, deterministic registration-order listings, transition-table-enforced activation, heartbeat recovery of offline devices, unregister pinned by active leases, capability changes under live leases refused), reservation gates (over-memory/over-concurrency refused with the honest reason, deterministic lease ids, expiry = created + ttl, mismatched/double release refused, released records leave the registry, busy schedulable while capacity remains, draining/offline refuse), lease expiry reclaimed on the FakeClock with capacity freed, LeaseGuard RAII (release on scope exit, detach hands over), the heartbeat monitor (fresh within timeout, stale judged Unhealthy+Offline once, no double counting, heartbeat recovery, failed devices left to their own path, ownership scoping), snapshot revision monotonicity + candidate filtering (ownership/state/health), and concurrency (4 threads × 25 registrations land exactly once with no leaked reservations) |
 | DistributedSchedulerTest | Deterministic scheduling (pure functions, no hardware/clock/threads): the partition property over many (N, K) pairs (exact coverage, no overlap/gaps, no empty shards when K > N, sizes balanced within 1, byte-identical determinism, zero-element/zero-shard refusals), shard id derivation (deterministic `<job>-s<index>`, charset shape checks, cap overflow refused not truncated), RoundRobin (one shard per capable device, recorded cluster revision, fresh-policy reproducibility, cursor rotation across calls), LeastLoaded (fewest allocated jobs then memory, tie-break by registration order), CapabilityFit (tightest memory slack), every stable rejection code (invalid_request / cluster_empty / device_unhealthy / unsupported_capability / no_device_available with fallback off / insufficient_resource), unknown policy names refused, fallback semantics (coalesce to existing devices, single-device multi-shard request, K>N caps, 1-element jobs), snapshot candidacy filters (ownership/state/health), and the topology seam (no fabricated links, undirected lookup, unknown pairs, unreported bandwidth/latency stay unknown) |
 | DistributedJobsTest | Job machinery semantics (pure functions): the full shard state machine (every legal transition incl. stale-plan assigned→pending, terminal finality), the job status derivation rules (empty→queued, pending/retrying→planning, assigned→scheduled, running→running, all-completed→completed, partial failure→failed — never disguised, failure outranks cancellation outranks success, unfinished outranks failed), terminal refusal of revival transitions, the honest Phase 11 mapping (planning/scheduled/running collapse to running; no new platform state), failure codes (stable snake_case names, parse round-trip, the retryable/non-retryable classifier, duplicate visible but not a failure), the retry policy (exponential backoff with the 60s clamp, attempt-ceiling semantics with no unbounded mode), and the ResultAggregator (shard-order reassembly bit-correct regardless of arrival order, duplicate first-verdict-wins with counts, unexpected shard indices, partial failure NOT completed with honest counts + failed-shard records + no faked payload, cancellations tracked separately) |
+| ServicePhase15Test | The Phase 15 contract fixes end to end: an Admin's privileged cancellation of a RUNNING foreign job actually cancels it (the Phase 14 loss is gone), is audited `privileged:cancel_any_job`, member foreign-cancel is Forbidden, foreign-user cancel is NotFound; the single-owner invariant at the facade (Owner grants refused to owner AND admin, exactly one owner after every attempt, refused grants audited); artifacts (creator/admin deletion authorization, cross-project NotFound, the 256-per-project capacity refusal and its release after deletion, audited deletions); the orchestrator's cancellation-intent delivery (RecordIntent accepted for a not-yet-visible job → the racing submit becomes Cancelled with ZERO shards executed; the Phase 12 default contract unchanged: unknown job → NotFound) |
+| WorkerTest | The native execution boundary on every system: payload synthesis (deterministic per job id, int32-safe VectorAdd operands, VectorScale scalar policy, zero/oversized refusals); the strict protocol codec (unknown fields/missing fields/wrong types refused, unified error body, complete-request validation); SimulatorNativeExecutor REAL execution (2 devices/2 shards bit-exact vs the host reference, honest backend reporting, terminal-job cancel refused, zero-element claims refused before execution); the agent loop over a scripted transport (no-work, claim→execute→complete with real result metadata, the cancel relay through the first heartbeat, unsupported-operation honest failure, refused claims are errors); HTTP transport configuration refusals (https refused up front, malformed endpoints, unresolvable hosts) |
 | DistributedWorkerTest | Worker/transport/simulator (every system, CPU backend): the LocalWorker lifecycle (Starting/Ready/Running/Draining/Stopped, refusal with real reasons before start/while draining/after stop, idempotent start), **slicing bit-exactness — slice → execute → reassemble equals the full-range execution for all three ops at a non-multiple size**, assignment validation (wrong device, empty range, out-of-domain range, unclaimed operation, unknown explicit backend refused without fallback, available explicit backend honored, identity carried on results), the loopback transport (dispatch, device-less ghost = device_lost, worker_for resolution, one worker per device, deterministic failure injection that fires BEFORE the worker and decrements visibly, cancel recording), and the local multi-device simulator (honest backend claims from a real Runtime probe — cpu always, canonical names only, activation to Ready+Healthy, conflicting re-registration refused, identical re-registration replayed, inconsistent concurrency declarations refused before anything is created) |
 | DistributedOrchestratorTest | The end-to-end acceptance scenarios through the real path (registry → placement → leases → workers → runtime → aggregation): **A** 1 device/1 shard success; **B** 4 devices/4 shards all success with deterministic plans and zero leaked capacity; **C** two jobs with resource isolation; **D** one device offline → 3-device fallback placement that never targets the offline device; **E** one injected failure → retry on a DIFFERENT device → bit-exact success with the retry visible; **F** permanent failures → exactly max_attempts per shard then job Failed with honest 0-of-2 counts and no faked payload; **G** empty cluster → stable `cluster_empty` rejection, oversized shard → stable `insufficient_resource`; **H** unclaimed backend → stable `unsupported_capability`; **I** concurrent submissions from two threads → every job terminal, allocated ≤ capacity throughout, every lease returned; **J** full Platform integration (store job mirrors queued→running→completed + result metadata recorded, payload stays local, foreign users see nothing in either layer); plus submission idempotency/conflict rules, deterministic cancellation via a blocking transport + condition variables (in-flight shard completes, the rest cancelled, terminal cancel refused, foreign cancel invisible), stale plans never force-executed against a never-settling registry, threaded execution bit-exactness, and config rejection at creation (unknown policy, zero heartbeat timeout) with request-bound refusals |
 | DistributedContractTest | The distributed wire contract (C++ reference): the create-job parse (full + minimal bodies, exact fields), every violation with its stable code and HTTP status (invalid_json 400, missing/unknown fields, invalid enum/id/value, zero/fractional/negative shard counts, unsupported protocol 422, smuggled payload fields rejected — metadata only), byte-deterministic cluster-view/job/shard serialization verified by re-parsing (revision, distributed state/health vocabulary, capacity/allocated objects, failed-shard attempt/retry/failure_code on the wire, no payload keys), and the shared Phase 11 status mapping (200/400/404/422) |
@@ -713,6 +793,7 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.12 | Distributed / Multi-GPU Device System (provider-neutral `vortyx::distributed` layer over the platform: device registry with atomic leases and cluster revisions, deterministic sharding + three scheduling policies, workers over the unchanged Runtime, loopback transport, bounded retry with stable failure codes, duplicate-safe deterministic aggregation, Phase 11 store integration, local multi-device simulator + `vortyx_cluster` diagnostic; real network transport deliberately deferred) | Implemented |
 | 0.13 | AI/ML Acceleration + Tensor Layer (provider-neutral `vortyx::tensor` layer over the distributed layer: N-D tensors with checked shape/stride/broadcast arithmetic, five explicit dtypes with defined semantics, placement on the Phase 11/12 identity system, storage exclusively through the Phase 4 resource system, a validated op surface (matmul/gemm/elementwise+broadcast/reductions/activations/softmax/transpose/reshape) with deterministic CPU reference kernels, a runtime adapter into the REAL engine (CPU/Vulkan), TensorGraph with deterministic planning and liveness-safe memory-slot reuse, capability-based backend dispatch, and capability-based placement over Phase 12 snapshots; no hardware tensor kernels / fp64 / autograd / quantization / cross-device transfer — documented non-goals) | Implemented |
 | 0.14 | Production GPU Platform / Serviceization (provider-neutral `vortyx::service` layer over the whole stack: projects + membership roles with ONE pure authorization table, project quota ledger with exactly-once release, deterministic fixed-window rate limiting, provider-neutral job queue, the full submission flow into the UNCHANGED Phase 12 orchestrator under the submitter's identity, bounded audit events, real-counter metrics, honest health reporting, artifact metadata registry, machine-readable JSON contract; no HTTP server in the core / no external provider adapters / no billing — documented non-goals) | **Implemented (current)** |
+| 0.15 | Production Platform Integration (service contract fixes: single-owner invariant, privileged audited cross-user cancellation with atomic intent delivery replacing sleep-polling, bounded artifact registry; the native execution boundary `vortyx::worker` + `vortyx_worker_agent` speaking the worker protocol over the UNCHANGED Phase 12 stack; the full service API surface over memory/Supabase persistence with RLS + additive migration 0003 (quota trigger, single-owner trigger, atomic claim RPC, centralized rate-limit RPC); stale-lease reconciliation; the no-build web console; 40 C++ + 54 TypeScript + 8 web tests) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform (tensor workloads across real backends, service API deployment, external provider adapters) | Planned |
 
 ## License

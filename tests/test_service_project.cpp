@@ -179,9 +179,22 @@ int main() {
         check_status(store.add_member(alice, created.project_id, "user-bob", ProjectRole::Admin,
                                       again),
                      SS::Conflict, "duplicate membership refused");
+        // Phase 15, the single-owner invariant: the Owner role is NEVER
+        // grantable through a membership path. Re-adding the owner WITH the
+        // Owner role is an unsatisfiable request shape -> InvalidInput (the
+        // refusal is still a refusal; the code names the real reason).
         check_status(store.add_member(alice, created.project_id, "user-alice",
                                       ProjectRole::Owner, again),
-                     SS::Conflict, "owner re-add refused");
+                     SS::InvalidInput, "owner role grant refused");
+        // Granting Owner to a brand-new user is the same refusal.
+        check_status(store.add_member(alice, created.project_id, "user-new",
+                                      ProjectRole::Owner, again),
+                     SS::InvalidInput, "owner role grant to foreign user refused");
+        // Re-adding the owner with a non-Owner role stays a STATE conflict
+        // (they are already a member).
+        check_status(store.add_member(alice, created.project_id, "user-alice",
+                                      ProjectRole::Admin, again),
+                     SS::Conflict, "owner re-add as admin refused");
 
         // Promote bob to admin, then bob manages members.
         // (add_member of an existing member is a Conflict, so removal first.)

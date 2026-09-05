@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.14.0
+    VERSION 0.15.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -35,6 +35,14 @@ option(VORTYX_ENABLE_TENSOR "Build the Vortyx tensor (AI/ML acceleration) layer"
 # TENSOR/PLATFORM=OFF, which disable it automatically — reproduces the
 # Phase 13 build exactly.
 option(VORTYX_ENABLE_SERVICE "Build the Vortyx service (platform serviceization) layer" ON)
+
+# Phase 15: the native execution agent (the execution-plane boundary).
+# The worker layer speaks the control plane's worker protocol and executes
+# claimed jobs on the UNCHANGED Phase 12 distributed stack. OFF — or
+# DISTRIBUTED/PLATFORM=OFF, which disable it automatically — reproduces the
+# Phase 14 build exactly (the agent is an ADJACENT process boundary, not a
+# core dependency of any layer below it).
+option(VORTYX_ENABLE_WORKER "Build the Vortyx native worker (execution agent) layer" ON)
 
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
@@ -244,10 +252,48 @@ if(VORTYX_ENABLE_SERVICE)
     endif()
 endif()
 
+# Worker layer (Phase 15): the native execution agent. It sits BESIDE the
+# layers above (nothing includes it; it links the distributed layer and the
+# platform JSON) and owns the worker-protocol boundary: claim/heartbeat/
+# complete over HTTP, execution through the UNCHANGED Phase 12 orchestrator
+# over the local simulated devices. When the distributed layer is OFF —
+# including the automatic PLATFORM=OFF case — this layer is OFF with it and
+# the build is exactly Phase 14's.
+if(VORTYX_ENABLE_WORKER)
+    if(NOT VORTYX_ENABLE_DISTRIBUTED)
+        message(STATUS "Vortyx: the distributed layer is OFF - the worker layer is disabled with it")
+        set(VORTYX_ENABLE_WORKER OFF)
+    else()
+        add_library(vortyx_worker STATIC
+            src/worker/native_executor.hpp    # the execution seam (INativeExecutor)
+            src/worker/native_executor.cpp    # Phase 12 stack execution + payload synthesis
+            src/worker/worker_protocol.hpp    # the wire contract (claim/heartbeat/complete)
+            src/worker/worker_protocol.cpp    # strict JSON codec (the platform JSON)
+            src/worker/worker_transport.hpp   # the transport interface
+            src/worker/http_transport.hpp     # the real HTTP/1.1 client
+            src/worker/http_transport.cpp     # POSIX/Winsock, plain http (documented scope)
+            src/worker/worker_agent.hpp       # the agent loop
+            src/worker/worker_agent.cpp       # claim -> execute -> report
+        )
+        target_link_libraries(vortyx_worker PUBLIC vortyx_distributed)
+
+        # The agent executable (Phase 15): claims jobs from the control
+        # plane and executes them on the real local stack. See
+        # src/worker_main.cpp for the configuration contract.
+        add_executable(vortyx_worker_agent
+            src/worker_main.cpp
+        )
+        target_link_libraries(vortyx_worker_agent PRIVATE vortyx_worker)
+        target_compile_definitions(vortyx_worker_agent PRIVATE VORTYX_BUILD_CONFIG="$<CONFIG>")
+    endif()
+endif()
+
 # GPU discovery on Windows uses DXGI (part of the Windows OS/SDK, no external
 # dependency). Only linked on Windows targets.
 if(WIN32)
     target_link_libraries(vortyx_core PRIVATE dxgi)
+    # The worker's HTTP transport uses Winsock (part of the OS).
+    target_link_libraries(vortyx_worker PUBLIC ws2_32)
 endif()
 
 if(VORTYX_HAS_VULKAN_COMPILED)

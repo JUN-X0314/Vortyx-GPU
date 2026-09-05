@@ -570,7 +570,7 @@ int main() {
         // record exists; no simulator worker — shards block in transport).
         vortyx::distributed::DeviceCapabilities caps;
         caps.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-        caps.metadata.software_version = "0.14.0";
+        caps.metadata.software_version = "0.15.0";
         caps.metadata.backends = {"cpu"};
         caps.metadata.operations = {"vector_add", "vector_multiply", "vector_scale"};
         caps.metadata.display_name = "blocked";

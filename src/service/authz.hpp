@@ -25,8 +25,14 @@
 // Role semantics (the minimal set the service actually enforces):
 //   Owner  — the creator. Everything, plus archiving the project. There is
 //            exactly one owner (the creator); the owner's role cannot be
-//            changed or removed.
-//   Admin  — manage members and project quota; cancel any project job.
+//            changed or removed (the single-owner invariant — Phase 15 makes
+//            it a hard rule: no add/remove/change path can produce a second
+//            owner, and the Owner role is not grantable through any
+//            membership path; ownership transfer does not exist yet and is
+//            documented as future work rather than faked).
+//   Admin  — manage members and project quota; cancel any project job
+//            (through the explicit privileged cancellation contract, see
+//            platform_service.hpp).
 //   Member — submit jobs, cancel own jobs, view project data, register
 //            artifacts.
 //   Viewer — read-only: view the project, its members and its jobs.
@@ -65,6 +71,7 @@ enum class ProjectAction : std::uint8_t {
     CancelOwnJob,    // cancel a job the caller submitted
     CancelAnyJob,    // cancel any job of the project (Admin+)
     RegisterArtifact, // attach artifact metadata to the project
+    DeleteArtifact,  // remove artifact metadata (creator always; Admin+ otherwise)
     ManageMembers,   // add/remove members (Admin+)
     ChangeQuota,     // change the project's quota (Admin+)
     ArchiveProject,  // archive the project (Owner only)
@@ -77,9 +84,20 @@ const char* to_string(ProjectAction action);
 // project store and the job service both call this; tests pin the table.
 //
 //   Viewer : ViewProject, ViewMembers, ViewJobs
-//   Member : + ViewUsage, SubmitJob, CancelOwnJob, ViewUsage, RegisterArtifact
-//   Admin  : + CancelAnyJob, ManageMembers, ChangeQuota
+//   Member : + ViewUsage, SubmitJob, CancelOwnJob, RegisterArtifact
+//   Admin  : + CancelAnyJob, DeleteArtifact, ManageMembers, ChangeQuota
 //   Owner  : + ArchiveProject
+// (DeleteArtifact is Admin+ in the table; the artifact's CREATOR may always
+// delete their own artifact — that caller identity check lives in the
+// facade, which combines it with this table row.)
 ServiceStatus authorize_project_action(ProjectRole role, ProjectAction action);
+
+// The single-owner invariant as a pure rule: the Owner role is NEVER
+// grantable through a membership path. Ownership is created exactly once —
+// by project creation — and an ownership-transfer feature does not exist
+// (documented future work). The project store and the service facade both
+// consult THIS function, so no membership path can drift into minting a
+// second owner. Pure.
+bool project_role_grantable(ProjectRole role);
 
 }  // namespace vortyx::service

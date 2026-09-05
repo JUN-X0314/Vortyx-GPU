@@ -182,6 +182,13 @@ ServiceStatus PlatformService::archive_project(const AuthContext& auth,
 ServiceStatus PlatformService::add_member(const AuthContext& auth, const ProjectId& project_id,
                                           const vortyx::platform::UserId& user_id,
                                           ProjectRole role, ProjectMember& out) {
+    // Defense in depth (the store re-checks): the single-owner invariant
+    // refuses an Owner grant before the store ever sees the request.
+    if (!project_role_grantable(role)) {
+        audit_->record(auth.user_id, project_id, "", AuditAction::MembershipChange,
+                       AuditOutcome::Denied, service_status_code(ServiceStatus::InvalidInput));
+        return ServiceStatus::InvalidInput;
+    }
     const ServiceStatus status = projects_->add_member(auth, project_id, user_id, role, out);
     audit_->record(auth.user_id, project_id, "", AuditAction::MembershipChange,
                    outcome_for(status),
@@ -647,21 +654,59 @@ ServiceStatus PlatformService::cancel_job(const AuthContext& auth, const JobId& 
     }
 
     if (needs_orchestrator_cancel) {
-        // The orchestrator record exists once its submit() started. A
-        // bounded handoff covers the record-creation window; a job that
-        // went terminal under us answers InvalidInput and the cancel
-        // reports the honest race outcome (the dispatcher still finalizes).
+        // The cancellation is delivered ATOMICALLY (Phase 15): the
+        // orchestrator either sets the flag on the live record or records a
+        // cancellation INTENT that submit() applies at record creation —
+        // the record-creation window needs no polling and no retry loop.
+        // The Phase 14 100x1ms sleep-poll handoff is gone.
+        //
+        // The two authorized paths:
+        //   * the submitter's own job  -> the ordinary owner path;
+        //   * another member's job     -> the EXPLICIT privileged path with
+        //     a trusted ServiceCancellation context (never identity
+        //     swapping). The privileged action is audited with the acting
+        //     admin's real identity and authority.
         DistributedJobRecord dist_record;
-        for (int attempt = 0; attempt < 100; ++attempt) {
-            const Status status = orchestrator_->cancel_job(auth, job_id, dist_record);
-            if (status != Status::NotFound) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Status orchestrator_status;
+        if (is_own) {
+            orchestrator_status = orchestrator_->cancel_job(
+                auth, job_id, dist_record, vortyx::distributed::CancelDelivery::RecordIntent);
+        } else {
+            const vortyx::distributed::ServiceCancellation cancellation(
+                auth.user_id, "project_admin");
+            orchestrator_status = orchestrator_->cancel_job_privileged(
+                cancellation, job_id, dist_record,
+                vortyx::distributed::CancelDelivery::RecordIntent);
         }
+
+        if (orchestrator_status == Status::InvalidInput) {
+            // The job went terminal under us — the honest race outcome.
+            std::lock_guard<std::mutex> lock(state_);
+            const auto it = records_.find(job_id);
+            if (it != records_.end() &&
+                vortyx::distributed::distributed_job_status_is_terminal(it->second.view.status)) {
+                out = it->second.view;
+                audit_->record(auth.user_id, project_id, job_id, AuditAction::JobCancel,
+                               AuditOutcome::Error,
+                               is_own ? "already_terminal" : "privileged:already_terminal");
+                return ServiceStatus::InvalidInput;
+            }
+            // Not terminal after all (cannot happen in the documented
+            // flow): fall through to the requested outcome, the dispatcher
+            // still finalizes.
+        }
+        // Delivered (flag or intent): the dispatcher finalizes. The audit
+        // records the privileged authority when the actor is not the
+        // submitter — the auditable-privileged-action rule.
+        audit_->record(auth.user_id, project_id, job_id, AuditAction::JobCancel,
+                       AuditOutcome::Ok,
+                       is_own ? "requested" : "privileged:cancel_any_job");
+    } else {
+        // For the not-yet-dispatched case the dispatcher's checkpoint
+        // observes the flag and finalizes; nothing else to do here.
+        audit_->record(auth.user_id, project_id, job_id, AuditAction::JobCancel,
+                       AuditOutcome::Ok, "requested");
     }
-    // For the not-yet-dispatched case the dispatcher's checkpoint observes
-    // the flag and finalizes; nothing else to do here.
-    audit_->record(auth.user_id, project_id, job_id, AuditAction::JobCancel, AuditOutcome::Ok,
-                   "requested");
     std::lock_guard<std::mutex> lock(state_);
     out = records_.at(job_id).view;
     return ServiceStatus::Ok;
@@ -816,6 +861,39 @@ ServiceStatus PlatformService::artifacts(const AuthContext& auth, const std::str
         return ServiceStatus::Forbidden;
     }
     return artifacts_store_->artifacts(project_id, out);
+}
+
+ServiceStatus PlatformService::delete_artifact(const AuthContext& auth,
+                                               const std::string& project_id,
+                                               const ArtifactId& artifact_id) {
+    ProjectRole role = ProjectRole::Viewer;
+    const ServiceStatus status = projects_->role_of(auth, project_id, role);
+    if (status != ServiceStatus::Ok) return status;
+
+    // Creator OR Admin+ (DeleteArtifact). Fetch first: the identity check
+    // needs the record, and a foreign/unknown artifact must stay invisible
+    // (NotFound — the anti-enumeration rule).
+    ArtifactMetadata existing;
+    const ServiceStatus fetch = artifacts_store_->artifact(artifact_id, existing);
+    if (fetch != ServiceStatus::Ok) {
+        return ServiceStatus::NotFound;
+    }
+    if (existing.project_id != project_id) {
+        return ServiceStatus::NotFound;  // cross-project reference: invisible
+    }
+    const bool is_creator = existing.created_by == auth.user_id;
+    if (!is_creator &&
+        authorize_project_action(role, ProjectAction::DeleteArtifact) != ServiceStatus::Ok) {
+        audit_->record(auth.user_id, project_id, "", AuditAction::ArtifactDelete,
+                       AuditOutcome::Denied, service_status_code(ServiceStatus::Forbidden));
+        return ServiceStatus::Forbidden;
+    }
+    const ServiceStatus result = artifacts_store_->unregister_artifact(project_id, artifact_id);
+    if (result == ServiceStatus::Ok) {
+        audit_->record(auth.user_id, project_id, "", AuditAction::ArtifactDelete,
+                       AuditOutcome::Ok, is_creator ? "creator" : "admin");
+    }
+    return result;
 }
 
 std::vector<AuditEvent> PlatformService::audit_tail_for_actor(const AuthContext& auth,

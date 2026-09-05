@@ -149,7 +149,7 @@ int main() {
         // the caller's aggregate must reflect it.
         vortyx::distributed::DeviceCapabilities caps;
         caps.metadata.protocol_version = vortyx::platform::kProtocolVersion;
-        caps.metadata.software_version = "0.14.0";
+        caps.metadata.software_version = "0.15.0";
         caps.metadata.backends = {"cpu"};
         caps.metadata.operations = {"vector_add"};
         caps.metadata.display_name = "h";

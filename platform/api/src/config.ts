@@ -4,14 +4,16 @@
 // classes explicit and impossible to mix up accidentally:
 //
 //   SERVER-ONLY (never expose to any client, never commit):
-//     SUPABASE_SERVICE_ROLE_KEY  — bypasses RLS. NOT used by any Phase 11
-//                                  endpoint; reserved for future privileged
-//                                  server-side jobs. Presence is detected
-//                                  here only to report readiness — the value
-//                                  itself is never logged, never serialized.
+//     SUPABASE_SERVICE_ROLE_KEY  — bypasses RLS. Phase 15 uses it ONLY for
+//                                  the worker-protocol paths (claim/heartbeat/
+//                                  complete run outside any user's identity)
+//                                  and reconciliation. Never logged, never
+//                                  serialized, never sent to a browser.
+//     VORTYX_WORKER_TOKEN        — the native worker's bearer secret.
+//     VORTYX_RECONCILE_TOKEN     — the reconciliation/cron secret.
 //
 //   SERVER-SIDE CONFIG (not secrets, not for browsers):
-//     SUPABASE_URL, SUPABASE_ANON_KEY, VORTYX_STORE
+//     SUPABASE_URL, SUPABASE_ANON_KEY, VORTYX_STORE, VORTYX_ALLOWED_ORIGIN
 //
 //   PUBLISHABLE BY DESIGN:
 //     SUPABASE_ANON_KEY — the anon key is meant to be client-visible; data
@@ -26,8 +28,10 @@
 // template; .env* files are git-ignored.
 
 import { makeAuthenticated, type AuthContext } from "./auth.ts";
+import { SOFTWARE_VERSION } from "./version.ts";
 import type { IPlatformStore } from "./store.ts";
 import { InMemoryPlatformStore } from "./memory-store.ts";
+import { InMemoryServiceStore, type IServiceStore } from "./service-store.ts";
 
 export type StoreKind = "memory" | "supabase";
 
@@ -37,6 +41,12 @@ export interface PlatformConfig {
   supabaseAnonKey: string | null;
   /** Presence only — the value is never read, logged or echoed. */
   serviceRoleKeyPresent: boolean;
+  /** The native worker's bearer secret (server-side only; presence-counted). */
+  workerToken: string | null;
+  /** The reconcile/cron secret (server-side only). */
+  reconcileToken: string | null;
+  /** The single origin allowed to call this API from a browser ("" = none). */
+  allowedOrigin: string;
   /** Set when VORTYX_STORE=supabase but required settings are missing. */
   configError: string | null;
 }
@@ -46,6 +56,7 @@ export function readConfig(env: Record<string, string | undefined>): PlatformCon
   const store: StoreKind = storeRaw === "supabase" ? "supabase" : "memory";
   const supabaseUrl = env["SUPABASE_URL"] ?? null;
   const supabaseAnonKey = env["SUPABASE_ANON_KEY"] ?? null;
+  const allowedOrigin = env["VORTYX_ALLOWED_ORIGIN"] ?? "";
 
   let configError: string | null = null;
   if (store === "supabase") {
@@ -59,6 +70,9 @@ export function readConfig(env: Record<string, string | undefined>): PlatformCon
     supabaseUrl,
     supabaseAnonKey,
     serviceRoleKeyPresent: Boolean(env["SUPABASE_SERVICE_ROLE_KEY"]),
+    workerToken: env["VORTYX_WORKER_TOKEN"] ?? null,
+    reconcileToken: env["VORTYX_RECONCILE_TOKEN"] ?? env["CRON_SECRET"] ?? null,
+    allowedOrigin,
     configError,
   };
 }
@@ -104,6 +118,12 @@ export interface ResolvedPlatform {
   store: IPlatformStore;
   verifier: TokenVerifier;
   storeKind: StoreKind;
+  /** The API's software version (single source: version.ts). */
+  softwareVersion: string;
+  service: IServiceStore;
+  workerToken: string | null;
+  reconcileToken: string | null;
+  allowedOrigin: string;
 }
 
 /**
@@ -116,16 +136,39 @@ export async function resolvePlatform(config: PlatformConfig): Promise<ResolvedP
     if (config.configError !== null || config.supabaseUrl === null || config.supabaseAnonKey === null) {
       throw new Error(config.configError ?? "supabase store is not configured");
     }
+    // Dynamic import: nothing in the test or local-dev path ever loads the
+    // supabase adapters (or @supabase/supabase-js).
     const adapter = await import("./supabase-store.ts");
+    const serviceAdapter = await import("./supabase-service-store.ts");
+    const service = serviceAdapter.createSupabaseServiceStore(
+      config.supabaseUrl,
+      config.supabaseAnonKey,
+      env_service_role(),
+    );
     return {
       store: adapter.createSupabaseStore(config.supabaseUrl, config.supabaseAnonKey),
       verifier: supabaseVerifier(config.supabaseUrl, config.supabaseAnonKey),
       storeKind: "supabase",
+      softwareVersion: SOFTWARE_VERSION,
+      service,
+      workerToken: config.workerToken,
+      reconcileToken: config.reconcileToken,
+      allowedOrigin: config.allowedOrigin,
     };
   }
   return {
     store: new InMemoryPlatformStore(),
     verifier: memoryVerifier(),
     storeKind: "memory",
+    softwareVersion: SOFTWARE_VERSION,
+    service: new InMemoryServiceStore(),
+    workerToken: config.workerToken,
+    reconcileToken: config.reconcileToken,
+    allowedOrigin: config.allowedOrigin,
   };
+}
+
+/** The service-role key never leaves the server environment. */
+function env_service_role(): string | null {
+  return process.env["SUPABASE_SERVICE_ROLE_KEY"] ?? null;
 }

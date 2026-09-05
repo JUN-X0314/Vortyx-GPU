@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Vortyx Platform</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <!--
+      Runtime configuration (PUBLISHABLE values only):
+      copy js/config.example.js to js/config.js and fill in your Supabase
+      project URL + anon key (both are public by design; data safety comes
+      from RLS) and the API base URL (empty string = same origin).
+      NEVER place a service-role key or worker token here.
+    -->
+    <script src="/js/config.js"></script>
+  </head>
+  <body>
+    <div id="app"><div class="state loading">Loading Vortyx…</div></div>
+    <script type="module" src="/js/main.js"></script>
+  </body>
+</html>

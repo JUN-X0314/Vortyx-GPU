@@ -125,8 +125,12 @@ public:
 
     // Adds a member (Admin+ per the authz table). Adding an existing member
     // is a Conflict. The owner's role cannot be granted again (they are
-    // already Owner — Conflict). Errors: Unauthenticated | NotFound |
-    // Forbidden | InvalidInput (bad user id / role) | Conflict | Internal.
+    // already Owner — Conflict). THE SINGLE-OWNER INVARIANT (Phase 15):
+    // granting the Owner role is refused with InvalidInput — ownership is
+    // minted exactly once, by project creation, and no membership path can
+    // produce a second owner. Errors: Unauthenticated | NotFound |
+    // Forbidden | InvalidInput (bad user id / role, owner grant) | Conflict
+    // | Internal.
     virtual ServiceStatus add_member(const vortyx::platform::AuthContext& auth,
                                      const ProjectId& project_id,
                                      const vortyx::platform::UserId& user_id, ProjectRole role,

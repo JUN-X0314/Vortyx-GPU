@@ -256,7 +256,7 @@ describe("distributed routes", () => {
           ? makeAuthenticated(token.slice("local:".length))
           : null,
       storeKind: "memory",
-      softwareVersion: "0.14.0",
+      softwareVersion: "0.15.0",
       distributed: new InMemoryDistributedStore(),
     };
   }

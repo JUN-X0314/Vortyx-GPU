@@ -32,6 +32,18 @@ ServiceStatus InMemoryArtifactStore::register_artifact(const ArtifactMetadata& r
     if (validation != ServiceStatus::Ok) return validation;
 
     std::lock_guard<std::mutex> lock(mutex_);
+    // The per-project bound (Phase 15): a registry that grows without limit
+    // is an unbounded-memory defect. The refusal is a capacity outcome, not
+    // a fabricated success.
+    std::size_t project_count = 0;
+    for (const ArtifactMetadata& artifact : artifacts_) {
+        if (artifact.project_id == request.project_id) project_count += 1;
+    }
+    if (project_count >= kMaxArtifactsPerProject) {
+        error = "the project has reached the artifact metadata capacity (" +
+                std::to_string(kMaxArtifactsPerProject) + ")";
+        return ServiceStatus::Unavailable;
+    }
     ArtifactMetadata stored = request;
     stored.artifact_id = generate_project_id();  // the same UUID-v4 id format
     stored.created_at_ms = clock_ ? clock_->now_ms() : 0;
@@ -60,6 +72,20 @@ ServiceStatus InMemoryArtifactStore::artifacts(const std::string& project_id,
         if (artifact.project_id == project_id) out.push_back(artifact);
     }
     return ServiceStatus::Ok;
+}
+
+ServiceStatus InMemoryArtifactStore::unregister_artifact(const std::string& project_id,
+                                                         const ArtifactId& artifact_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = artifacts_.begin(); it != artifacts_.end(); ++it) {
+        if (it->artifact_id != artifact_id) continue;
+        // Project-scope enforcement: an artifact of ANOTHER project is
+        // invisible here (the same anti-enumeration rule as everywhere).
+        if (it->project_id != project_id) return ServiceStatus::NotFound;
+        artifacts_.erase(it);
+        return ServiceStatus::Ok;
+    }
+    return ServiceStatus::NotFound;
 }
 
 std::size_t InMemoryArtifactStore::size() const {

@@ -44,6 +44,7 @@ enum class AuditAction : std::uint8_t {
     DeviceStateChange,
     ResultAccess,
     ArtifactRegister,   // artifact METADATA registered (no payload exists)
+    ArtifactDelete,     // artifact METADATA removed (no payload exists)
     AdminAction,
 };
 

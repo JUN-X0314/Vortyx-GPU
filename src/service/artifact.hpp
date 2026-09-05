@@ -1,21 +1,32 @@
 #pragma once
 
-// Artifact metadata registry (Phase 14).
+// Artifact metadata registry (Phase 14, bounded in Phase 15).
 //
 // The provider-neutral place where ARTIFACT METADATA lives: a named,
 // sized, owned object associated with a project (a future home for model
 // files, kernel artifacts, tensor result references).
 //
-// HONEST SCOPE: metadata ONLY. There is NO payload storage in Phase 14 — no
-// bytes are accepted, buffered, hashed or "uploaded", and no external object
-// store is claimed (no fake success: registering an artifact records the
-// DECLARED byte size as metadata, it does not store anything). A real
-// ArtifactStore (local FS, S3, ...) is a future provider behind the same
-// interface shape; the metadata registry is the part that can be real today.
+// HONEST SCOPE: metadata ONLY. There is NO payload storage — no bytes are
+// accepted, buffered, hashed or "uploaded", and no external object store is
+// claimed (no fake success: registering an artifact records the DECLARED
+// byte size as metadata, it does not store anything). A real payload store
+// (local FS, S3, ...) is a separate storage adapter concept, documented as
+// the deployment boundary; the metadata registry is the part that is real
+// today. PAYLOAD VS METADATA stay strictly separated: nothing here can ever
+// carry file content.
+//
+// BOUNDED (Phase 15): the store holds at most kMaxArtifactsPerProject
+// metadata entries PER PROJECT and refuses registration beyond the bound
+// with ServiceStatus::Unavailable (a capacity refusal is never converted
+// into a fake success). Removal is explicit — unregister_artifact deletes
+// metadata (and ONLY metadata; there are no stored bytes to remove).
 //
 // AUTHORIZATION: project-scoped. Registering requires Member+ (the authz
-// table); listing requires Viewer+. Metadata carries no secrets (name,
-// sizes, ids only).
+// table); listing requires Viewer+; deletion is the creator OR Admin+
+// (DeleteArtifact) — the facade enforces the identity rule, the store
+// stays authorization-free by contract (its callers already checked, the
+// same trust shape as the Phase 11 store's device paths). Metadata carries
+// no secrets (name, sizes, ids only).
 
 #include <cstdint>
 #include <memory>
@@ -31,6 +42,11 @@
 namespace vortyx::service {
 
 using ArtifactId = std::string;
+
+// The per-project bound on artifact METADATA entries (Phase 15): a registry
+// that can grow without limit is an unbounded-memory defect; the bound is a
+// named, honest capacity refusal.
+inline constexpr std::size_t kMaxArtifactsPerProject = 256;
 
 struct ArtifactMetadata {
     ArtifactId artifact_id;
@@ -64,10 +80,19 @@ public:
     virtual ServiceStatus artifacts(const std::string& project_id,
                                     std::vector<ArtifactMetadata>& out) const = 0;
 
+    // Removes one artifact's metadata. NotFound when the artifact is
+    // unknown OR belongs to a different project (the caller has already
+    // passed the project-level authorization; this signature keeps the
+    // project scope honest so a cross-project id can never be removed
+    // through a project the caller can see). Errors: NotFound | Internal.
+    virtual ServiceStatus unregister_artifact(const std::string& project_id,
+                                              const ArtifactId& artifact_id) = 0;
+
     virtual std::size_t size() const = 0;
 };
 
-// The in-memory reference store.
+// The in-memory reference store (bounded per project — see
+// kMaxArtifactsPerProject).
 class InMemoryArtifactStore final : public IArtifactStore {
 public:
     ServiceStatus register_artifact(const ArtifactMetadata& request,
@@ -75,6 +100,8 @@ public:
     ServiceStatus artifact(const ArtifactId& artifact_id, ArtifactMetadata& out) const override;
     ServiceStatus artifacts(const std::string& project_id,
                             std::vector<ArtifactMetadata>& out) const override;
+    ServiceStatus unregister_artifact(const std::string& project_id,
+                                      const ArtifactId& artifact_id) override;
     std::size_t size() const override;
 
     // The injected clock for created_at stamps (the facade wires it).

@@ -93,6 +93,26 @@ jobs:
         working-directory: platform/api
         run: node --test --experimental-strip-types
 
+  # Phase 15: the web console is a no-build static SPA; its LOGIC modules
+  # (session lifecycle, API client, error mapping) are tested with node:test
+  # against DOM/fetch/localStorage stubs. No npm install, no secrets, no
+  # network — the same local/mock discipline as the platform-api job.
+  web-console:
+    name: Web console tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test platform/web logic modules (node --test)
+        working-directory: platform/web
+        run: node --test
+
   # Phase 9: the CPU-only build is a core project guarantee ("building and
   # running Vortyx never requires the Vulkan SDK"), so CI verifies it
   # explicitly: no Vulkan SDK/loader, VORTYX_ENABLE_VULKAN=OFF, full test

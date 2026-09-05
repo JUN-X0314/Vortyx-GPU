@@ -251,3 +251,26 @@ if(VORTYX_ENABLE_SERVICE)
     target_link_libraries(test_service_ops PRIVATE vortyx_service)
     add_test(NAME ServiceOpsTest COMMAND test_service_ops)
 endif()
+
+# Phase 15: the service contract fixes and the native worker.
+# - Service Phase 15 tests pin the privileged cross-user cancellation (the
+#   Phase 14 contract fix, condvar-deterministic), the single-owner
+#   invariant, the bounded artifact registry with creator/admin deletion
+#   authorization, and the cancellation-intent delivery that replaced the
+#   sleep-poll handoff.
+# - Worker tests run on EVERY system (no GPU, no real network): payload
+#   synthesis determinism, the strict worker-protocol codec, the agent loop
+#   over a scripted transport (claim -> execute -> report, cancel relay,
+#   honest failure reporting) and a REAL end-to-end execution through the
+#   Phase 12 stack (bit-exact vs the host reference).
+if(VORTYX_ENABLE_SERVICE)
+    add_executable(test_service_phase15 test_service_phase15.cpp)
+    target_link_libraries(test_service_phase15 PRIVATE vortyx_service)
+    add_test(NAME ServicePhase15Test COMMAND test_service_phase15)
+endif()
+
+if(VORTYX_ENABLE_WORKER)
+    add_executable(test_worker test_worker.cpp)
+    target_link_libraries(test_worker PRIVATE vortyx_worker)
+    add_test(NAME WorkerTest COMMAND test_worker)
+endif()

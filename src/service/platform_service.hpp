@@ -37,13 +37,25 @@
 // CANCELLATION RACES (all defined, all tested):
 //   - queued job          -> removed from the queue, Cancelled, quota
 //                            released exactly once;
-//   - dispatched job      -> the orchestrator's cancel flag is set (bounded
-//                            handoff retry covers the record-creation
-//                            window); the dispatcher finalizes;
+//   - dispatched job      -> the orchestrator's cancel flag is delivered
+//                            ATOMICALLY (Phase 15: the orchestrator records
+//                            a cancellation INTENT for the record-creation
+//                            window — the Phase 14 sleep-poll retry loop is
+//                            gone; no polling, no lost cancellation);
 //   - cancel vs completion -> one of the two wins by the underlying state
 //                            machines; the loser reports InvalidInput
 //                            ("already terminal"). No double quota release
 //                            is possible (the ledger releases exactly once).
+//
+// PRIVILEGED CROSS-USER CANCELLATION (Phase 15 — the Phase 14 contract fix):
+// an admin may cancel another member's job (CancelAnyJob). The service does
+// NOT impersonate the owner and does NOT touch auth.user_id: it mints a
+// vortyx::distributed::ServiceCancellation — a trusted service-level
+// cancellation context that cannot be constructed outside this facade — and
+// calls the orchestrator's explicit privileged path. The acting admin's real
+// identity and the "project_admin" authority are recorded in the audit
+// trail; the ownership path (a member cancelling their own job) is
+// unchanged and still enforced by the orchestrator itself.
 //
 // THREADING / LOCK ORDER (documented contract):
 //   state_ (service records) -> (quota | queue | audit | metrics internal
@@ -115,6 +127,8 @@ struct SubmitJobRequest {
 
 // Service configuration. Defaults are the documented safe starting policy
 // (rate limiting ON, finite quotas, finite capacities — nothing unlimited).
+// The artifact metadata registry's per-project bound is the shared constant
+// kMaxArtifactsPerProject (artifact.hpp) — one named policy, not a knob.
 struct PlatformServiceConfig {
     std::uint32_t dispatcher_count = 2;                 // 1..8
     bool rate_limit_enabled = true;
@@ -242,6 +256,12 @@ public:
     ServiceStatus artifacts(const vortyx::platform::AuthContext& auth,
                             const std::string& project_id,
                             std::vector<ArtifactMetadata>& out) const;
+    // Removes artifact METADATA (there is no payload storage to remove).
+    // The artifact's creator may always delete; anyone else needs Admin+
+    // (ProjectAction::DeleteArtifact). Audited.
+    ServiceStatus delete_artifact(const vortyx::platform::AuthContext& auth,
+                                  const std::string& project_id,
+                                  const ArtifactId& artifact_id);
 
     // ---- observability -------------------------------------------------------
 
