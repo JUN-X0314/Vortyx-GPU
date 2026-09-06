@@ -1,0 +1,13 @@
+{
+  "name": "@vortyx/deployment-root",
+  "version": "0.16.1",
+  "private": true,
+  "type": "module",
+  "description": "Deployment glue for the single-project Vercel topology. The root api/[...route].ts catch-all re-uses the real platform API router (platform/api/src/vercel.ts); when VORTYX_STORE=supabase its dynamic import chain reaches @supabase/supabase-js, so the dependency is declared here for the function's module resolution. It is never installed or used by the C++ build, the platform/api tests (which run inside platform/api with their own manifest), or the web console.",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
