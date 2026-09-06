@@ -76,15 +76,19 @@ vcpkg_installed/
 .env.*
 !.env.example
 
-# Node (platform/api)
+# Node (platform/api and the deployment root)
 node_modules/
 
 # test output & cache
 Testing/
 .cache/
 
-# Phase 15: real runtime config must never be committed
-platform/web/js/config.js
+# Phase 15: API-side runtime env files are still never committed. Since
+# Phase 16.0.1 the WEB console's publishable runtime config
+# (platform/web/js/config.js) IS committed deliberately: it carries only
+# the Supabase project URL, the publishable anon key and the API base URL
+# (all public by design; data safety comes from RLS). A service-role key,
+# worker token, DB password or any other secret must NEVER be placed there.
 platform/api/.env
 platform/api/.env.local
 platform/api/.env.production
