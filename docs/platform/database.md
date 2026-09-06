@@ -150,18 +150,18 @@ adds the SERVICE surface's tables. Apply order stays lexicographic:
 | `quota_policies` | per-project quota POLICY | usage is NOT stored — it derives from in-flight `service_jobs` |
 | `artifact_metadata` | artifact METADATA | no payload column exists; per-project count bounded (trigger) |
 | `audit_events` | the audit trail | metadata only; signup audited by a trigger |
-| `rate_limit_windows` | centralized fixed-window counters | touched only by `vortyx_rate_limit_take` |
+| `rate_limit_windows` | centralized fixed-window counters | touched only by `vortyx_rate_limit_take` (defined by 0004) |
 
 ### Database-enforced invariants (the API layer ALSO enforces these — defense in depth)
 
 | Invariant | Mechanism |
 |---|---|
-| Quota policy (concurrent jobs / shards / memory) | `vortyx_enforce_service_quota()` BEFORE INSERT trigger — closes the check-then-insert race for concurrent submissions |
+| Quota policy (concurrent jobs / shards / memory) | `vortyx_enforce_service_quota()` BEFORE INSERT trigger — closes the check-then-insert race for concurrent submissions (0004: the trigger serializes on the project row with `SELECT … FOR UPDATE` before reading usage) |
 | Single-owner invariant | `vortyx_enforce_single_owner()` trigger on `project_members` — only the creator row may carry `owner`; grants/demotions refused |
-| Artifact metadata bound | `vortyx_enforce_artifact_capacity()` trigger — 256 per project |
+| Artifact metadata bound | `vortyx_enforce_artifact_capacity()` trigger — 256 per project (0004: serialized on the same project-row lock) |
 | Atomic worker claim | `vortyx_worker_claim()` RPC — reconcile stale leases + `FOR UPDATE SKIP LOCKED` selection (two workers can never claim one job) |
 | Idempotent result commit | `vortyx_worker_complete()` RPC — duplicate reports return the existing terminal state; foreign/lost claims refused |
-| Centralized rate limiting | `vortyx_rate_limit_take()` RPC — one fixed window per key in the database (per-instance memory would be meaningless across serverless instances) |
+| Centralized rate limiting | `vortyx_rate_limit_take()` RPC (defined by 0004) — one fixed window per key in the database; the `ON CONFLICT (key) DO UPDATE` row lock makes each take atomic across API instances |
 | Stale-lease recovery | `vortyx_worker_reconcile()` — running + expired lease → `failed("worker_lease_expired")` |
 
 ### RLS policy map (0003)
@@ -185,3 +185,60 @@ adds the SERVICE surface's tables. Apply order stays lexicographic:
 The service-role client (used ONLY by the worker-protocol paths and
 reconciliation) bypasses RLS by design; the API never exposes it to a
 browser.
+
+---
+
+## Phase 15.0.1 — concurrency hardening (migration 0004_service_hardening.sql)
+
+`0004_service_hardening.sql` is the stabilization pass over 0003's control
+plane. It alters no table, drops nothing, renames nothing; it replaces two
+trigger function BODIES in place (same names, same signatures, same
+error-message shapes, so no client can tell except through the closed race)
+and adds what 0003 documented but did not ship.
+
+### What changed and why the database is the right place
+
+| Change | Mechanism | The race it closes |
+|---|---|---|
+| Project-row quota serialization | `vortyx_enforce_service_quota()` now takes `SELECT … FOR UPDATE` on the project's own row BEFORE reading the policy or the usage count | Two simultaneous submissions both reading usage = N, both passing `N + 1 ≤ limit`, both inserting. With the lock, the second transaction blocks on the project row and re-reads usage AFTER the first commits (READ COMMITTED per-statement snapshots) — the overcommit is impossible, not just unlikely |
+| Artifact-capacity serialization | `vortyx_enforce_artifact_capacity()` takes the SAME project-row lock first | 255 artifacts + two simultaneous inserts producing 257. Same lock key as the quota trigger means the two paths can never interleave with each other |
+| `vortyx_rate_limit_take()` defined | atomic `INSERT … ON CONFLICT (key) DO UPDATE … RETURNING attempts` on `rate_limit_windows` | 0003 referenced this function but never defined it (every supabase-mode submission failed at the limiter). The conflict row lock serializes concurrent takes on one key, so the counter is exact across serverless instances; window boundaries are exact multiples, refused attempts count — the memory/C++ limiter semantics |
+| Terminal-state immutability | `service_jobs_terminal_immutable` BEFORE UPDATE trigger: a terminal row (`completed`/`failed`/`cancelled`) freezes against ANY column change, for every writer | An RLS client holding a valid access token could previously rewrite history directly over REST (resurrect a failed job, fabricate a completed result). Now the database refuses, regardless of which client issues the UPDATE |
+| In-flight usage index | `service_jobs_inflight_idx` partial index on `(project_id) WHERE status IN ('queued','running')` | Performance of the trigger's hot read: it touches only the in-flight set (bounded by the quota itself), not the project's full job history. Reason recorded here per the project's index rule |
+
+### Lock-order contract (single rule, all project-level mutations)
+
+```
+projects row (FOR UPDATE)  ->  service_jobs / artifact_metadata reads
+```
+
+Every path that mutates project-scoped state (quota trigger, artifact
+capacity trigger) locks the project row FIRST and then reads dependent
+tables with plain SELECTs — no path ever holds a dependent-row lock while
+waiting for the project row, so the reverse order that produces deadlocks
+cannot occur. Different projects lock different rows and remain fully
+parallel. The worker-protocol functions lock only `service_jobs` rows
+(`FOR UPDATE SKIP LOCKED` for claims, conditional UPDATEs for terminal
+transitions) and never take the project lock, so they cannot invert the
+order either.
+
+### Idempotency and replay (unchanged semantics, now race-exact)
+
+- `service_jobs.job_id` remains the primary key — the idempotency key. A
+  duplicate logical submission is impossible at the storage layer no matter
+  when the duplicate arrives.
+- Same key + same owner + same project + same payload = replay (the API's
+  `created: false`; the concurrent-duplicate insert path re-reads the
+  winner and applies the same rule — no false conflict for a retried
+  submission).
+- Same key + different anything = conflict (409).
+- A replay is never rate-limited and never re-charged against quota.
+- Terminal rows are immutable (the trigger above), so a duplicate completion
+  report and a re-issued cancel land on the same honest outcomes.
+
+### Applying
+
+Apply order stays lexicographic: 0001 → 0002 → 0003 → 0004. The file is
+idempotent (CREATE OR REPLACE with unchanged signatures, IF NOT EXISTS,
+idempotent GRANT/REVOKE). `anon` can execute nothing new; the limiter RPC
+is granted to `authenticated` (and `service_role`) only.

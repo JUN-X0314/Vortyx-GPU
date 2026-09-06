@@ -1,6 +1,6 @@
 {
   "name": "@vortyx/platform-api",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "private": true,
   "description": "Vortyx GPU platform control-plane API (Phase 11+12+15: control plane + service surface + worker protocol)",
   "type": "module",

@@ -572,3 +572,256 @@ test("worker protocol: stale leases are reconciled honestly", async () => {
   const jobs = (await call(d, request("GET", `/api/projects/${project}/jobs`, { authorization: `Bearer ${alice}` }))).body;
   assert.equal(jobs.jobs[0].status, "failed");
 });
+
+// =====================================================================
+// Concurrent submissions + artifact capacity (Phase 15.0.1 hardening)
+//
+// DETERMINISTIC by construction, not by timing: the memory store's
+// check-then-act sections (idempotency pre-check -> quota check -> insert)
+// contain no await, so each caller's critical section is atomic under the
+// event loop. Promise.all puts N requests in flight simultaneously (the
+// barrier) and the interleaving points are exactly the await boundaries —
+// the outcomes below are the SAME on every run, on every machine.
+// =====================================================================
+
+async function makeProjectWithQuota(
+  quota: { max_concurrent_jobs: number; max_running_shards: number; max_memory_bytes: number },
+): Promise<{ d: PlatformDeps; project: string }> {
+  const store = new InMemoryServiceStore(() => FIXED_NOW, makeId);
+  const d: PlatformDeps = { ...deps(), service: store };
+  const project = (await call(d, request("POST", "/api/projects", {
+    authorization: `Bearer ${alice}`, body: { name: "p" },
+  }))).body.project_id;
+  const set = await call(d, request("PUT", `/api/projects/${project}/quota`, {
+    authorization: `Bearer ${alice}`, body: quota,
+  }));
+  assert.equal(set.status, 200);
+  return { d, project };
+}
+
+function submitReq(project: string, jobId: string, overrides: Record<string, unknown> = {}) {
+  return request("POST", `/api/projects/${project}/jobs`, {
+    authorization: `Bearer ${alice}`,
+    body: { ...SUBMIT, job_id: jobId, requested_shard_count: 1, ...overrides },
+  });
+}
+
+test("concurrency: concurrent_limit_is_one admits exactly one of two simultaneous submissions", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 1, max_running_shards: 16, max_memory_bytes: 1073741824,
+  });
+  // Two submissions race for one quota slot (Promise.all = the barrier).
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-race-a")),
+    call(d, submitReq(project, "job-race-b")),
+  ]);
+  const statuses = responses.map((r) => r.status).sort();
+  assert.deepEqual(statuses, [200, 429], "exactly one wins; the loser is quota_exceeded");
+  // The ledger holds exactly one in-flight job — the quota was never exceeded.
+  const usage = (await call(d, request("GET", `/api/projects/${project}/usage`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(usage.active_jobs, 1);
+});
+
+test("concurrency: concurrent_limit_is_two admits exactly two of three simultaneous submissions", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 2, max_running_shards: 16, max_memory_bytes: 1073741824,
+  });
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-race-a")),
+    call(d, submitReq(project, "job-race-b")),
+    call(d, submitReq(project, "job-race-c")),
+  ]);
+  const accepted = responses.filter((r) => r.status === 200);
+  const refused = responses.filter((r) => r.status === 429);
+  assert.equal(accepted.length, 2, "exactly the quota's worth accepted");
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0].body.error.code, "quota_exceeded");
+  const usage = (await call(d, request("GET", `/api/projects/${project}/usage`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(usage.active_jobs, 2);
+});
+
+test("concurrency: simultaneous submissions cannot exceed the running_shard quota", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 10, max_running_shards: 3, max_memory_bytes: 1073741824,
+  });
+  // Three submissions of 2 shards each race for a 3-shard budget.
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-shard-a", { requested_shard_count: 2 })),
+    call(d, submitReq(project, "job-shard-b", { requested_shard_count: 2 })),
+    call(d, submitReq(project, "job-shard-c", { requested_shard_count: 2 })),
+  ]);
+  const accepted = responses.filter((r) => r.status === 200);
+  assert.equal(accepted.length, 1, "only one 2-shard job fits the 3-shard budget");
+  const usage = (await call(d, request("GET", `/api/projects/${project}/usage`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(usage.running_shards, 2);
+  assert.ok(usage.running_shards <= 3, "shard usage never exceeds the policy");
+});
+
+test("concurrency: simultaneous submissions cannot exceed the memory quota", async () => {
+  // vector_add reserves 12 bytes/element; 1000 elements = 12,000 bytes.
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 10, max_running_shards: 64, max_memory_bytes: 20000,
+  });
+  // Three 12,000-byte reservations race for a 20,000-byte budget.
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-mem-a", { element_count: 1000 })),
+    call(d, submitReq(project, "job-mem-b", { element_count: 1000 })),
+    call(d, submitReq(project, "job-mem-c", { element_count: 1000 })),
+  ]);
+  const accepted = responses.filter((r) => r.status === 200);
+  assert.equal(accepted.length, 1, "only one 12,000-byte reservation fits 20,000 bytes");
+  const usage = (await call(d, request("GET", `/api/projects/${project}/usage`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.ok(usage.reserved_memory_bytes <= 20000, "reserved memory never exceeds the policy");
+});
+
+test("concurrency: same_job_id_submitted_simultaneously yields one logical reservation", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 10, max_running_shards: 64, max_memory_bytes: 1073741824,
+  });
+  // The identical submission twice, in flight at the same moment: the
+  // primary key (here the store's map) admits exactly one row; the other
+  // caller is the idempotent replay (created=false), never a second job
+  // and never a second quota charge.
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-dup-1")),
+    call(d, submitReq(project, "job-dup-1")),
+  ]);
+  for (const r of responses) {
+    assert.equal(r.status, 200);
+  }
+  const created = responses.filter((r) => r.body.created === true);
+  const replayed = responses.filter((r) => r.body.created === false);
+  assert.equal(created.length, 1, "exactly one logical reservation");
+  assert.equal(replayed.length, 1, "the duplicate is the honest replay");
+  const jobs = (await call(d, request("GET", `/api/projects/${project}/jobs`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(jobs.jobs.length, 1, "no duplicate row exists");
+  const usage = (await call(d, request("GET", `/api/projects/${project}/usage`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(usage.active_jobs, 1, "the replay never double-charges the quota");
+});
+
+test("concurrency: same_job_id_with_different_payloads_submitted_simultaneously conflicts exactly once", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 10, max_running_shards: 64, max_memory_bytes: 1073741824,
+  });
+  const responses = await Promise.all([
+    call(d, submitReq(project, "job-conflict-1", { element_count: 1000 })),
+    call(d, submitReq(project, "job-conflict-1", { element_count: 2000 })),
+  ]);
+  const statuses = responses.map((r) => r.status).sort();
+  assert.deepEqual(statuses, [200, 409], "one submission wins, the other conflicts");
+  const jobs = (await call(d, request("GET", `/api/projects/${project}/jobs`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(jobs.jobs.length, 1);
+  assert.equal(jobs.jobs[0].element_count, 1000, "the winner's payload is the record");
+});
+
+test("concurrency: artifact_capacity_boundary admits exactly one of two simultaneous inserts", async () => {
+  const store = new InMemoryServiceStore(() => FIXED_NOW, makeId);
+  const d: PlatformDeps = { ...deps(), service: store };
+  const project = (await call(d, request("POST", "/api/projects", {
+    authorization: `Bearer ${alice}`, body: { name: "p" },
+  }))).body.project_id;
+
+  // Fill the project to 255 of the 256-artifact capacity.
+  for (let i = 0; i < 255; i += 1) {
+    const registered = await call(d, request("POST", `/api/projects/${project}/artifacts`, {
+      authorization: `Bearer ${alice}`, body: { name: `artifact-${i}`, declared_byte_size: 1 },
+    }));
+    assert.equal(registered.status, 200);
+  }
+
+  // Two inserts race for the LAST slot: exactly one lands; the count stays
+  // at the capacity bound, never 257.
+  const responses = await Promise.all([
+    call(d, request("POST", `/api/projects/${project}/artifacts`, {
+      authorization: `Bearer ${alice}`, body: { name: "artifact-race-a", declared_byte_size: 1 },
+    })),
+    call(d, request("POST", `/api/projects/${project}/artifacts`, {
+      authorization: `Bearer ${alice}`, body: { name: "artifact-race-b", declared_byte_size: 1 },
+    })),
+  ]);
+  const statuses = responses.map((r) => r.status).sort();
+  assert.deepEqual(statuses, [200, 503], "one insert wins; the loser is the honest capacity refusal");
+
+  const atCapacity = await call(d, request("POST", `/api/projects/${project}/artifacts`, {
+    authorization: `Bearer ${alice}`, body: { name: "artifact-over", declared_byte_size: 1 },
+  }));
+  assert.equal(atCapacity.status, 503, "a full project refuses further artifacts");
+  const list = (await call(d, request("GET", `/api/projects/${project}/artifacts`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(list.artifacts.length, 256, "the final count is exactly the capacity");
+});
+
+test("concurrency: artifact capacity is enforced per project — no cross-project blocking", async () => {
+  const store = new InMemoryServiceStore(() => FIXED_NOW, makeId);
+  const d: PlatformDeps = { ...deps(), service: store };
+  const projectA = (await call(d, request("POST", "/api/projects", {
+    authorization: `Bearer ${alice}`, body: { name: "a" },
+  }))).body.project_id;
+  const projectB = (await call(d, request("POST", "/api/projects", {
+    authorization: `Bearer ${alice}`, body: { name: "b" },
+  }))).body.project_id;
+
+  // Both projects race to the boundary INDEPENDENTLY: one project's
+  // serialization point never blocks the other's progress.
+  const responses = await Promise.all([
+    call(d, request("POST", `/api/projects/${projectA}/artifacts`, {
+      authorization: `Bearer ${alice}`, body: { name: "a-artifact", declared_byte_size: 1 },
+    })),
+    call(d, request("POST", `/api/projects/${projectB}/artifacts`, {
+      authorization: `Bearer ${alice}`, body: { name: "b-artifact", declared_byte_size: 1 },
+    })),
+  ]);
+  assert.equal(responses[0].status, 200);
+  assert.equal(responses[1].status, 200);
+  const listA = (await call(d, request("GET", `/api/projects/${projectA}/artifacts`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  const listB = (await call(d, request("GET", `/api/projects/${projectB}/artifacts`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(listA.artifacts.length, 1);
+  assert.equal(listB.artifacts.length, 1);
+  assert.equal(listB.artifacts[0].name, "b-artifact", "each project holds exactly its own artifact");
+});
+
+test("concurrency: two workers cannot claim the same queued job simultaneously", async () => {
+  const { d, project } = await makeProjectWithQuota({
+    max_concurrent_jobs: 10, max_running_shards: 64, max_memory_bytes: 1073741824,
+  });
+  await call(d, submitReq(project, "job-claim-1"));
+  const authz = "Bearer worker-secret-token";
+  // Two claims in flight at once: exactly one carries a job.
+  const claims = await Promise.all([
+    call(d, request("POST", "/api/worker/claim", {
+      authorization: authz, body: { worker_id: "worker-a", lease_ms: 60000 },
+    })),
+    call(d, request("POST", "/api/worker/claim", {
+      authorization: authz, body: { worker_id: "worker-b", lease_ms: 60000 },
+    })),
+  ]);
+  const withJob = claims.filter((c) => c.body.claimed === true && c.body.job !== null && c.body.job !== undefined);
+  const withoutJob = claims.filter((c) => c.body.claimed === false && (c.body.job === null || c.body.job === undefined));
+  assert.equal(withJob.length, 1, "exactly one worker holds the claim");
+  assert.equal(withoutJob.length, 1, "the other worker sees an empty queue");
+  // The losing worker did NOT mutate the claim state.
+  const detail = (await call(d, request("GET", `/api/service/jobs/job-claim-1`, {
+    authorization: `Bearer ${alice}`,
+  }))).body;
+  assert.equal(detail.status, "running");
+  assert.equal(detail.attempt, 1, "the attempt counter incremented exactly once");
+});

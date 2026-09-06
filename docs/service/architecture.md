@@ -121,3 +121,61 @@ code; every accepted submission and every terminal outcome is audited.
 - No billing, no GPU marketplace, no multi-region clusters, no real
   network transport. Each absence is an explicit extension point for a
   future phase, never a TODO disguised as done.
+
+---
+
+## Phase 15.0.1 — production stabilization (what changed and why)
+
+15.0.1 adds no feature. It hardens the Phase 15 control plane against the
+concurrency that real operation implies: many simultaneous submissions, many
+workers, duplicate deliveries, and direct database access by authenticated
+clients.
+
+- **Project-level quota serialization (database)**. The Supabase quota
+  trigger (`vortyx_enforce_service_quota`, migration 0003) read the policy
+  and the in-flight usage with plain MVCC SELECTs. Two simultaneous
+  submissions to one project could both read usage = N, both pass, and both
+  insert. Migration 0004 makes the trigger take `SELECT … FOR UPDATE` on the
+  project's own row FIRST and re-read usage after acquiring it — a
+  serialization point that is exact under any number of API instances,
+  because it lives in the row lock, not in any process. Quota semantics are
+  untouched: the same three policy fields, the same `queued`/`running`
+  usage ledger, the same refusal codes, the same defaults.
+- **Artifact-capacity serialization (database)**. The 256-per-project bound
+  had the identical count-then-insert race; the capacity trigger now uses
+  the SAME project-row lock. One lock key and one lock order for all
+  project-level mutations — `projects` row first, then dependent reads —
+  mean the quota path and the artifact path can never interleave or
+  deadlock (neither ever holds a second lock the other needs first).
+- **Idempotency under concurrency (API adapter)**. The TypeScript Supabase
+  adapter's pre-check/insert pair handles the concurrent-duplicate case by
+  rule, not by luck: a 23505 on the insert re-reads the committed winner
+  and applies the same replay/conflict rule as the pre-check (same payload
+  = `created: false` replay; different payload/owner/project = conflict).
+  The job id's primary key guarantees exactly one logical reservation in
+  every interleaving; a retry is never double-charged.
+- **Terminal-state immutability (database)**. A BEFORE UPDATE trigger
+  freezes terminal `service_jobs` rows for every writer — the API (which
+  never edits terminal rows), the service-role worker protocol (which
+  replays without writing), and RLS clients (which could previously rewrite
+  a terminal job directly over REST). This is the "job ID idempotency
+  cannot create duplicate logical reservations / terminal state is
+  immutable" invariant enforced where it belongs: in the row.
+- **Honest race-loser outcomes (API adapter)**. A cancel that loses the
+  claim/reconcile race (the conditional update sees zero rows) now returns
+  the same "already terminal" outcome as the memory store and the C++
+  service — not a fabricated 500.
+- **The centralized rate limiter shipped**. `vortyx_rate_limit_take` was
+  documented by 0003 but never defined; 0004 adds it as an atomic
+  `INSERT … ON CONFLICT (key) DO UPDATE` counter (row-lock-serialized,
+  exact across instances, `authenticated`-only execute). The API's
+  submission path now actually works in supabase mode.
+- **What did NOT change**: the worker pipeline (agent → protocol → native
+  executor → orchestrator → shards), the execution operations
+  (`vector_add` / `vector_multiply` / `vector_scale`), stale-lease
+  semantics (expired leases are failed honestly, never auto-retried), the
+  service-role boundary (service-role keys never reach a browser; worker
+  credentials are never logged), the authorization table, the audit
+  actions, and the C++ service layer (its quota ledger and artifact
+  registry were already mutex-serialized, with the concurrent overcommit
+  pinned by `ServiceQuotaTest`).

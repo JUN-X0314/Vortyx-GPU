@@ -192,9 +192,14 @@ function mapAudit(row: AuditRow): AuditEvent {
   };
 }
 
-function mapDbError(message: string, code: string | null): { status: "conflict" | "forbidden" | "quota_exceeded" | "unavailable" | "internal"; error: string } {
+function mapDbError(message: string, code: string | null): { status: "conflict" | "forbidden" | "not_found" | "quota_exceeded" | "unavailable" | "internal"; error: string } {
   if (code === "23505") return { status: "conflict", error: message };
   if (code === "42544" || code === "42501") return { status: "forbidden", error: message };
+  // The hardening trigger's shape (0004): the locked project row vanished —
+  // the same not_found the API reports for any foreign/unknown project.
+  if (message.startsWith("project_missing")) {
+    return { status: "not_found", error: "no such project" };
+  }
   // The quota trigger's documented message shape: "quota_exceeded:<field>".
   if (message.startsWith("quota_exceeded:")) {
     return { status: "quota_exceeded", error: `${message.slice("quota_exceeded:".length)} would be exceeded` };
@@ -204,6 +209,18 @@ function mapDbError(message: string, code: string | null): { status: "conflict" 
     return { status: "unavailable", error: message.slice("artifact_capacity:".length) };
   }
   return { status: "internal", error: message };
+}
+
+/**
+ * True when a PostgREST error is just ".single()/.maybeSingle() seeing zero
+ * rows" (the conditional-update race loser), not a real failure. Detected
+ * by code when the driver exposes it, by message/details otherwise (the
+ * shape varies slightly across PostgREST/supabase-js versions).
+ */
+function isZeroRowsResult(error: { code?: string | null; message: string; details?: string | null }): boolean {
+  if (error.code === "PGRST116") return true;
+  const text = `${error.message} ${error.details ?? ""}`;
+  return text.includes("0 rows");
 }
 
 // ---------------------------------------------------------------------------
@@ -520,8 +537,8 @@ export function createSupabaseServiceStore(
 
       // The INSERT. The quota trigger (vortyx_enforce_service_quota) checks
       // the policy atomically against in-flight usage — concurrent
-      // submissions cannot race past it (the check-then-insert gap the
-      // memory store closes with its single-threaded section).
+      // submissions cannot race past it (0004: the trigger serializes on
+      // the project row before reading usage).
       const { data, error } = await client
         .from("service_jobs")
         .insert({
@@ -535,7 +552,39 @@ export function createSupabaseServiceStore(
         })
         .select("*")
         .single();
-      if (error !== null) return mapDbError(error.message, error.code);
+      if (error !== null) {
+        // A 23505 here is the CONCURRENT duplicate case: another request
+        // with the same job_id committed between the pre-check above and
+        // this insert (the primary key is the arbiter — exactly one
+        // logical reservation exists). Re-read the winner and apply the
+        // SAME replay/conflict rule as the pre-check, so a retried
+        // submission keeps its idempotency semantics no matter when the
+        // duplicate lands.
+        if (error.code === "23505") {
+          const { data: winner } = await client
+            .from("service_jobs")
+            .select("*")
+            .eq("job_id", request.job_id)
+            .maybeSingle();
+          if (winner !== null && winner !== undefined) {
+            const job = mapJob(winner as ServiceJobRow);
+            const samePayload =
+              job.submitted_by === auth.user_id &&
+              job.project_id === projectId &&
+              job.operation === request.operation &&
+              job.element_count === request.element_count &&
+              job.requested_backend === request.requested_backend &&
+              job.requested_shard_count === request.requested_shard_count;
+            if (samePayload) {
+              await audit(client, auth.user_id, projectId, request.job_id, "job_submit", "ok", "replay");
+              return { status: "ok", record: job, created: false };
+            }
+          }
+          await audit(client, auth.user_id, projectId, request.job_id, "job_submit", "denied", "conflict");
+          return { status: "conflict", error: "job id already used with a different submission" };
+        }
+        return mapDbError(error.message, error.code);
+      }
       await audit(client, auth.user_id, projectId, request.job_id, "job_submit", "ok", "");
       return { status: "ok", record: mapJob(data as ServiceJobRow), created: true };
     },
@@ -609,6 +658,10 @@ export function createSupabaseServiceStore(
       if (job.status === "queued") {
         // Conditional update: the worker claim is racing us — whoever wins
         // the state transition decides (the documented cancel/claim race).
+        // The LOSER of that race observes zero updated rows (supabase-js
+        // surfaces .single()'s empty result as a PGRST116-shaped error) —
+        // mapped honestly to the same "already terminal" outcome the
+        // memory store returns, never to a fabricated internal error.
         const { data: updated, error } = await client
           .from("service_jobs")
           .update({ status: "cancelled", error: "cancelled", terminal_at_ms: Date.now() })
@@ -616,7 +669,12 @@ export function createSupabaseServiceStore(
           .eq("status", "queued")
           .select("*")
           .single();
-        if (error !== null) return mapDbError(error.message, error.code);
+        if (error !== null) {
+          if (isZeroRowsResult(error)) {
+            return { status: "invalid_input", error: "the job is already terminal" };
+          }
+          return mapDbError(error.message, error.code);
+        }
         if (updated !== null && updated !== undefined) {
           await audit(client, auth.user_id, job.project_id, jobId, "job_cancel", "ok",
             isOwn ? "cancelled_in_queue" : "privileged:cancel_any_job");
@@ -632,7 +690,18 @@ export function createSupabaseServiceStore(
           .eq("status", "running")
           .select("*")
           .single();
-        if (error !== null) return mapDbError(error.message, error.code);
+        if (error !== null) {
+          // The reconcile path failed the job between the read above and
+          // this update: the job went terminal under us — the honest
+          // race-loser outcome (mirror of the C++ 422), not a 500.
+          if (isZeroRowsResult(error)) {
+            return { status: "invalid_input", error: "the job is already terminal" };
+          }
+          return mapDbError(error.message, error.code);
+        }
+        if (updated === null || updated === undefined) {
+          return { status: "invalid_input", error: "the job is already terminal" };
+        }
         await audit(client, auth.user_id, job.project_id, jobId, "job_cancel", "ok",
           isOwn ? "requested" : "privileged:cancel_any_job");
         return { status: "ok", record: mapJob(updated as ServiceJobRow) };

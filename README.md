@@ -6,9 +6,17 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 15 (v0.15.0) — Production Platform Integration
+## Current Phase: Phase 15.0.1 (v0.15.1) — Production Stabilization
 
 Phase 15 turns the Phase 1–14 stack into **one product**: the Vortyx Platform. Control plane and execution plane are separate; the boundary between them is the **worker protocol**, and the engine below it is the UNCHANGED Phase 12 distributed stack.
+
+**Stabilization (15.0.1 — concurrency hardened at the database level, not by convention)**:
+- **Quota serialization**: migration `0004_service_hardening.sql` closes the read-usage-then-insert race the 0003 quota trigger still had (two simultaneous submissions could both read usage = N and both insert). The trigger now takes `SELECT … FOR UPDATE` on the project's own row BEFORE reading policy or usage; submissions to one project serialize on that single row, submissions to different projects stay parallel. Quota semantics are unchanged (same policy fields, same `queued`/`running` usage ledger, same refusal codes).
+- **Artifact-capacity serialization**: the 256-per-project artifact bound had the same count-then-insert race (255 + two simultaneous inserts could reach 257). The capacity trigger now takes the SAME project-row lock first — one lock key, one lock order (`projects` row → dependent reads), no new deadlock surface.
+- **The missing rate-limit RPC shipped**: 0003 documented `vortyx_rate_limit_take` but never defined it (in supabase mode every submission would fail at the limiter). It now exists — an atomic `INSERT … ON CONFLICT (key) DO UPDATE` fixed-window counter whose row lock makes the count exact across API instances; executable by `authenticated` only.
+- **Terminal-state immutability, enforced**: a `BEFORE UPDATE` trigger freezes terminal `service_jobs` rows for every writer (RLS clients included) — a completed/failed/cancelled job cannot be resurrected or rewritten by a direct REST call holding a valid access token.
+- **Honest duplicate/race outcomes**: a concurrent duplicate `job_id` insert re-reads the winner and applies the same replay/conflict rule as the pre-check (no false 409 for a same-payload retry); a cancel that loses the claim/reconcile race returns the same "already terminal" outcome the memory store returns, never a fabricated 500.
+- **Deterministic concurrency tests**: the TypeScript suite now races submissions, artifact inserts and worker claims simultaneously (`Promise.all` barriers, no sleeps) and pins the exact outcomes — one winner per quota slot, one logical reservation per job id, one claim per job, 256 final artifacts at the boundary.
 
 **Service contract fixes (Phase 14's known gaps, closed structurally)**:
 - **Single-owner invariant**: the `Owner` role is never grantable through any membership path (`project_role_grantable` — one pure rule consulted by the store AND the facade; also enforced in the database by a trigger in migration 0003). Ownership is minted exactly once, by project creation; no ownership transfer exists.
@@ -423,7 +431,7 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.15.0
+  Version: 0.15.1
   Phase:   15 (Production Platform Integration)
   Build:   Release
 ========================================
