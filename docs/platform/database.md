@@ -242,3 +242,17 @@ Apply order stays lexicographic: 0001 → 0002 → 0003 → 0004. The file is
 idempotent (CREATE OR REPLACE with unchanged signatures, IF NOT EXISTS,
 idempotent GRANT/REVOKE). `anon` can execute nothing new; the limiter RPC
 is granted to `authenticated` (and `service_role`) only.
+
+This order and those claims are verified, not asserted: CI applies
+0001 → 0004 verbatim, in lexicographic order, to a real `postgres:17`
+service container, re-applies 0004 to exercise its idempotency, and then
+reproduces the races in the database (quota, shards, memory, the artifact
+256 boundary, the rate-limit counter, terminal immutability, the claim
+race, the single-owner invariant). The runner is
+`scripts/pg_integration_test.py` — the same script runs locally against
+any reachable PostgreSQL 17 (`psql` on PATH, connection entirely through
+the standard `PG*` environment variables; it creates the `auth`-schema
+stubs Supabase normally provides, drops/recreates its test database, and
+exits non-zero on any failed check). It is test-only and touches no
+production database; applying to a real Supabase project remains the
+operator's procedure.

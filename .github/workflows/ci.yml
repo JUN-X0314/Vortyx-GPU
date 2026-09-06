@@ -243,3 +243,82 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-no-service -C Release --output-on-failure
+
+  # Phase 15.0.1 verification hardening: the database-level guarantees
+  # (project-row quota serialization, artifact-capacity serialization, the
+  # rate-limit RPC, terminal-state immutability, the claim race) are
+  # enforced by migration 0004 in REAL PostgreSQL — so CI runs them against
+  # a REAL PostgreSQL 17, the documented target version. The committed
+  # script applies 0001 -> 0004 verbatim in lexicographic order (the
+  # dependency chain proven by applying it), then races submissions /
+  # artifact inserts / rate-limit takes / worker claims from concurrent
+  # connections and pins the exact outcomes. The PGPASSWORD below is the
+  # EPHEMERAL service-container credential: it exists only inside this job
+  # and is never a repository secret or a real environment credential.
+  postgres-integration:
+    name: PostgreSQL 17 integration (migrations + concurrency)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Run integration suite (stubs + 0001..0004 + concurrency races)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: vortyx
+        run: python3 scripts/pg_integration_test.py
+
+  # Phase 15.0.1 verification hardening: the whole C++ test suite under
+  # AddressSanitizer + UndefinedBehaviorSanitizer (Debug, GCC/Clang-only
+  # option VORTYX_ENABLE_SANITIZERS — with MSVC the configure refuses
+  # honestly). UBSan is built with -fno-sanitize-recover=all and ASan aborts
+  # by default, so a sanitizer finding fails CTest and fails this job —
+  # sanitizer runs execute the tests, they never stop at compile-only.
+  # Vulkan is OFF here to keep the sanitizer run hermetic (no software GPU
+  # stack under ASan); the Vulkan-enabled functional path is covered by the
+  # matrix jobs above. This job also gives the Debug configuration its CI
+  # build+test coverage.
+  build-sanitizers:
+    name: Build & Test Sanitizers (ASan+UBSan, Debug, Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Ubuntu 24.04 runners ship vm.mmap_rnd_bits=32, which breaks the
+      # AddressSanitizer shadow mapping; 28 is the documented workaround.
+      - name: Fix ASan kernel knob
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure (CMake, sanitizers ON, Vulkan OFF)
+        shell: bash
+        run: cmake -B build-sanitize -S . -DCMAKE_BUILD_TYPE=Debug -DVORTYX_ENABLE_SANITIZERS=ON -DVORTYX_ENABLE_VULKAN=OFF
+
+      - name: Build
+        run: cmake --build build-sanitize -j2
+
+      - name: Test
+        run: ctest --test-dir build-sanitize -C Debug --output-on-failure

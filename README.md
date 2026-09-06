@@ -32,6 +32,11 @@ Phase 15 turns the Phase 1–14 stack into **one product**: the Vortyx Platform.
 
 **Verified end to end locally (real commands, real output)**: dev-server + authenticated project creation + job submission + idempotent replay + `vortyx_worker_agent` claiming and executing both jobs through the Phase 12 stack (`completed`, `2/2/0` shards, `result=5000 elements via cpu`) + quota released + cancel path + audit trail + metrics. The same flow is pinned by the C++ (`ServicePhase15Test`, `WorkerTest`) and TypeScript (`service.test.ts`) suites.
 
+**Verification, stated precisely (code exists ≠ locally run ≠ CI run)**:
+- **GitHub Actions CI (every push/PR to main)** — Linux + Windows matrix building and testing: default, CPU-only (`VORTYX_ENABLE_VULKAN=OFF`), `VORTYX_ENABLE_PLATFORM=OFF`, `VORTYX_ENABLE_TENSOR=OFF`, `VORTYX_ENABLE_SERVICE=OFF`, plus Clang; CTest with `--output-on-failure` (no hidden failures, no `continue-on-error` around tests). The TypeScript service/API suite (including the 10 deterministic concurrency tests) and the web console suite run as their own jobs. A sanitizer job builds the FULL suite in Debug with AddressSanitizer + UndefinedBehaviorSanitizer (`VORTYX_ENABLE_SANITIZERS`, `-fno-sanitize-recover=all` — a sanitizer finding fails the job) and runs every test. A PostgreSQL 17 integration job applies `0001 → 0004` verbatim, in lexicographic order, to a real `postgres:17` service container and then REPRODUCES the races in the database: concurrent quota (limit 1 → exactly one winner, no loser row), shard and memory quotas, the artifact 255+2 → exactly 256 race, duplicate `job_id` PK backstop, 20 concurrent rate-limit takes → exactly 10 admitted, terminal-state immutability (resurrection and result rewrite both refused by the trigger), the `FOR UPDATE SKIP LOCKED` worker claim race, the single-owner invariant, and a 0004 re-apply (its idempotency, tested not asserted). The committed runner is `scripts/pg_integration_test.py` — the same script runs locally against any reachable PostgreSQL 17.
+- **Local verification (real commands, real output)**: the dev-server flow above; the full C++ suite (40 tests) in Release and under ASan/UBSan; the feature-off configurations; the TypeScript and web suites; `scripts/pg_integration_test.py` against a local PostgreSQL 17 (29 checks).
+- **Not verified anywhere, on purpose**: no claim is made about a real Supabase production project (migrations there remain the operator's documented apply procedure), real GPU hardware, or any of the absent features listed below.
+
 **Honest scope (stated, not buried)**: there is still NO billing, NO marketplace, NO multi-region, NO TLS in the C++ worker, NO artifact payload storage (metadata only), NO GPU telemetry anywhere (utilization/VRAM/temperature are never displayed because they are never measured), NO automatic worker provisioning on any cloud, and NO re-execution of stale jobs (recovery marks them failed; a retry is an explicit resubmission). Each absence is a documented extension point, never a TODO disguised as done.
 
 ---
@@ -735,7 +740,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.14.0 |
+| VersionTest | Version constants match 0.15.1 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |

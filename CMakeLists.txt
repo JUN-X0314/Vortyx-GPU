@@ -44,6 +44,22 @@ option(VORTYX_ENABLE_SERVICE "Build the Vortyx service (platform serviceization)
 # core dependency of any layer below it).
 option(VORTYX_ENABLE_WORKER "Build the Vortyx native worker (execution agent) layer" ON)
 
+# Verification-only option (Phase 15.0.1): build every target with
+# AddressSanitizer + UndefinedBehaviorSanitizer so CTest failures surface
+# memory errors and UB instead of silently continuing. GCC/Clang only —
+# with MSVC the option is an honest configure-time error, not a silent no-op.
+# UBSan is configured with -fno-sanitize-recover=all so a runtime UB report
+# aborts the test (a failing sanitizer run must fail CI, not just log).
+option(VORTYX_ENABLE_SANITIZERS "Build with AddressSanitizer + UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
+if(VORTYX_ENABLE_SANITIZERS)
+    if(MSVC)
+        message(FATAL_ERROR "VORTYX_ENABLE_SANITIZERS is GCC/Clang-only; MSVC sanitizers are not wired up (use the GitHub Actions ubuntu sanitizer job)")
+    else()
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+        add_link_options(-fsanitize=address,undefined)
+    endif()
+endif()
+
 # Compiler warnings (applied to all targets in this directory and below)
 if(MSVC)
     add_compile_options(/W4)
