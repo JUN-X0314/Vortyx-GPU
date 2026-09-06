@@ -145,7 +145,7 @@ int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  Vortyx GPU" << std::endl;
     std::cout << "  Version: " << VORTYX_VERSION_STRING << std::endl;
-    std::cout << "  Phase:   15 (Production Platform Integration)" << std::endl;
+    std::cout << "  Phase:   16 (Adaptive Compute Fabric)" << std::endl;
     std::cout << "  Build:   " << VORTYX_BUILD_CONFIG << std::endl;
     std::cout << "========================================" << std::endl;
 

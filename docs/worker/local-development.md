@@ -45,7 +45,7 @@ Expected honest output (a machine without a Vulkan device):
 
 ```
 Vortyx Worker (Phase 15 native execution agent, config Release)
-version 0.15.1
+version 0.16.0
 control plane probe: HTTP 200
 [idle] no queued work
 [claimed] job <id> -> completed, recorded=true

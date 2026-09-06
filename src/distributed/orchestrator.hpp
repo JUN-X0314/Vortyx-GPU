@@ -206,6 +206,17 @@ public:
         // provider-neutral store (create_job / update_job / put_result)
         // using the submitter's own AuthContext — no privileged path.
         vortyx::platform::IPlatformStore* platform_store = nullptr;
+
+        // Optional Phase 16 seam (additive): when set, this policy REPLACES
+        // the config-name policy — the caller (the Adaptive Compute
+        // Fabric's policy bridge) supplies its own ISchedulingPolicy
+        // implementation while keeping every other orchestrator behavior
+        // unchanged (stale-plan checks, leases, retries, checkpoint
+        // semantics). Default null: the config-name policy is built exactly
+        // as before. The config's scheduler_policy is still validated (an
+        // unknown name stays a configuration error) but is UNUSED when the
+        // override is present.
+        std::shared_ptr<ISchedulingPolicy> policy_override;
     };
 
     // Constructs the orchestrator. 'policy' comes from the config name via
@@ -290,7 +301,7 @@ public:
 
 private:
     DistributedOrchestrator(Deps deps, DistributedConfig config, RetryPolicy retry,
-                            std::unique_ptr<ISchedulingPolicy> policy);
+                            std::shared_ptr<ISchedulingPolicy> policy);
 
     // The synchronous execution pipeline (caller holds no lock; the
     // orchestrator's mutex guards record state transitions only).
@@ -339,7 +350,7 @@ private:
     Deps deps_;
     DistributedConfig config_;
     RetryPolicy retry_;
-    std::unique_ptr<ISchedulingPolicy> policy_;
+    std::shared_ptr<ISchedulingPolicy> policy_;  // config-name built, or the Phase 16 override
     std::unique_ptr<HeartbeatMonitor> heartbeat_;
 
     std::vector<std::unique_ptr<DistributedJobRecord>> jobs_;  // submission order

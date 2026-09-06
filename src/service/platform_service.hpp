@@ -80,6 +80,8 @@
 #include <vector>
 
 #include "distributed/distributed.hpp"  // orchestrator + registry/transport/clock
+#include "fabric/contract_fabric.hpp"   // the Phase 16 plan summary view
+#include "fabric/policy_bridge.hpp"     // the Phase 16 policy seam
 #include "platform/platform.hpp"
 #include "service/artifact.hpp"
 #include "service/audit.hpp"
@@ -116,6 +118,14 @@ struct ServiceJobView {
     std::int64_t total_shards = -1;
     std::int64_t succeeded_shards = -1;
     std::int64_t failed_shards = -1;
+
+    // Phase 16 (optional): the Adaptive Compute Fabric's plan metadata —
+    // present ONLY when the service was created with fabric_planning and
+    // the job was dispatched through the fabric-planned path. plan_available
+    // stays false for cancelled-in-queue jobs (they were never planned) —
+    // an honest absence, never a fabricated plan.
+    bool plan_available = false;
+    vortyx::fabric::PlanSummary plan;
 };
 
 // The submission request: project scope + the EXISTING Phase 12 request
@@ -138,6 +148,15 @@ struct PlatformServiceConfig {
     std::size_t audit_max_entries = 10000;              // bounded ring
     std::size_t max_queue_depth = 1024;                 // service-level capacity
     std::uint32_t max_requested_shard_count = 64;       // service-level shard cap
+
+    // Phase 16 (optional, default OFF): route job placement through the
+    // Adaptive Compute Fabric's deterministic planner (the orchestrator
+    // still executes everything — leases, retries, checkpoint semantics
+    // unchanged). Default OFF keeps the Phase 14/15 placement behavior
+    // byte-identical for every existing caller; planning is an explicit
+    // opt-in, and the fabric planner config is validated at create().
+    bool fabric_planning = false;
+    vortyx::fabric::FabricPlannerConfig fabric_planner;
 };
 
 class PlatformService {
@@ -327,6 +346,13 @@ private:
     QuotaEngine quota_;
     std::unique_ptr<RateLimiter> rate_limiter_;  // built at create()
     ServiceMetrics metrics_;
+
+    // Phase 16 (optional): the fabric policy the orchestrator was built
+    // with (non-null only when config.fabric_planning). The service reads
+    // per-job lineage from it after dispatch returns (happens-before via
+    // the dispatch handoff) and forgets the lineage at terminal finalize —
+    // bounded state, the same discipline as the request map.
+    std::shared_ptr<vortyx::fabric::FabricPolicy> fabric_policy_;
 
     mutable std::mutex state_;              // guards records_ + order_
     std::unordered_map<vortyx::platform::JobId, ServiceJobRecord> records_;

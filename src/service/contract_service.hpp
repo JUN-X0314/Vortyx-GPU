@@ -31,7 +31,9 @@ std::string serialize_project(const ProjectRecord& project);
 //  "element_count":N,"requested_shard_count":N,"requested_backend":"...",
 //  "status":"queued|running|completed|failed|cancelled","error":"...",
 //  "submitted_at_ms":N,"terminal_at_ms":N|null,
-//  "total_shards":N|null,"succeeded_shards":N|null,"failed_shards":N|null}
+//  "total_shards":N|null,"succeeded_shards":N|null,"failed_shards":N|null,
+//  "plan":null|{"plan_version":N,"planner":"...","planner_version":"...",
+//               "cluster_revision":N,"devices":["..."],"reason":"..."}}
 std::string serialize_service_job(const ServiceJobView& job);
 
 // {"error":{"code":"...","message":"..."}} — the machine-readable error

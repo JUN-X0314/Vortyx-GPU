@@ -98,7 +98,15 @@ vortyx::platform::Status DistributedOrchestrator::create(Deps deps,
     vortyx::platform::Status status = config.validate(error);
     if (status != vortyx::platform::Status::Ok) return status;
 
-    std::unique_ptr<ISchedulingPolicy> policy = make_scheduling_policy(config.scheduler_policy);
+    std::shared_ptr<ISchedulingPolicy> policy;
+    if (deps.policy_override != nullptr) {
+        // Phase 16 seam: the caller's policy implementation (e.g. the
+        // Adaptive Compute Fabric's bridge) replaces the config-name
+        // policy. Every other orchestrator behavior is unchanged.
+        policy = deps.policy_override;
+    } else {
+        policy = make_scheduling_policy(config.scheduler_policy);
+    }
     if (policy == nullptr) {
         error = "unknown scheduler policy '" + config.scheduler_policy + "'";
         return vortyx::platform::Status::InvalidInput;
@@ -114,7 +122,7 @@ vortyx::platform::Status DistributedOrchestrator::create(Deps deps,
 
 DistributedOrchestrator::DistributedOrchestrator(Deps deps, DistributedConfig config,
                                                  RetryPolicy retry,
-                                                 std::unique_ptr<ISchedulingPolicy> policy)
+                                                 std::shared_ptr<ISchedulingPolicy> policy)
     : deps_(std::move(deps)),
       config_(config),
       retry_(retry),

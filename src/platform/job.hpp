@@ -116,11 +116,14 @@ struct JobEnvelope {
     // remapped, and honoring/refusing it is Phase 12+ execution policy.
     std::string requested_backend;
 
-    // RESERVED placeholder (transport field only). Phase 11 has no priority
-    // scheduling anywhere — the Scheduler (Phase 7) and the TaskQueue never
-    // see this field, and no behavior depends on it. Stored verbatim so the
-    // wire contract will not need a breaking change when a later phase
-    // defines real semantics. Until then, consumers must not interpret it.
+    // Phase 16 defines the real semantics this field was reserved for: the
+    // Adaptive Compute Fabric's planner consumes the numeric value as a
+    // PLANNING-ORDER preference (higher values plan earlier among
+    // topologically ready nodes; see src/fabric/workload.hpp and
+    // docs/fabric/planning.md). It is a deterministic tie-breaking input —
+    // NOT a fairness/starvation-free scheduling guarantee. The value is
+    // still carried verbatim everywhere; consumers outside the fabric
+    // continue to ignore it.
     std::int32_t priority = 0;
 
     // The control-plane protocol this submission speaks (kProtocolVersion).

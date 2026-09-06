@@ -216,6 +216,10 @@ if(VORTYX_ENABLE_TENSOR)
     add_executable(test_tensor_distributed test_tensor_distributed.cpp)
     target_link_libraries(test_tensor_distributed PRIVATE vortyx_tensor)
     add_test(NAME TensorDistributedTest COMMAND test_tensor_distributed)
+
+    add_executable(test_tensor_fabric test_tensor_fabric.cpp)
+    target_link_libraries(test_tensor_fabric PRIVATE vortyx_tensor)
+    add_test(NAME TensorFabricTest COMMAND test_tensor_fabric)
 endif()
 
 # Phase 14: Production GPU Platform / Serviceization.
@@ -267,10 +271,49 @@ if(VORTYX_ENABLE_SERVICE)
     add_executable(test_service_phase15 test_service_phase15.cpp)
     target_link_libraries(test_service_phase15 PRIVATE vortyx_service)
     add_test(NAME ServicePhase15Test COMMAND test_service_phase15)
+
+    add_executable(test_service_fabric test_service_fabric.cpp)
+    target_link_libraries(test_service_fabric PRIVATE vortyx_service)
+    add_test(NAME ServiceFabricTest COMMAND test_service_fabric)
 endif()
 
 if(VORTYX_ENABLE_WORKER)
     add_executable(test_worker test_worker.cpp)
     target_link_libraries(test_worker PRIVATE vortyx_worker)
     add_test(NAME WorkerTest COMMAND test_worker)
+endif()
+
+# Phase 16: the Adaptive Compute Fabric.
+# - Fabric tests run on EVERY system (no GPU, no network): the workload
+#   descriptor + deterministic envelope derivation, the cost model's named
+#   score components with checked integer arithmetic, the workload graph
+#   (deterministic ids, cycle detection, smallest-ready-id planning order),
+#   the deterministic planner (byte-identical plans, structured refusals,
+#   ownership scoping, priority/locality/backend preferences, exclusion
+#   constraints), plan lineage and the safe replanning rule (succeeded
+#   shards preserved verbatim, monotonic versions, bounded ring), the
+#   policy bridge end to end over REAL virtual devices (deterministic plan
+#   drives the UNCHANGED Phase 12 orchestrator; mid-flight device failure
+#   re-plans to version 2 without re-running succeeded shards; stale
+#   clusters fail honestly; terminal semantics unchanged).
+if(VORTYX_ENABLE_FABRIC)
+    add_executable(test_fabric_core test_fabric_core.cpp)
+    target_link_libraries(test_fabric_core PRIVATE vortyx_fabric)
+    add_test(NAME FabricCoreTest COMMAND test_fabric_core)
+
+    add_executable(test_fabric_graph test_fabric_graph.cpp)
+    target_link_libraries(test_fabric_graph PRIVATE vortyx_fabric)
+    add_test(NAME FabricGraphTest COMMAND test_fabric_graph)
+
+    add_executable(test_fabric_planner test_fabric_planner.cpp)
+    target_link_libraries(test_fabric_planner PRIVATE vortyx_fabric)
+    add_test(NAME FabricPlannerTest COMMAND test_fabric_planner)
+
+    add_executable(test_fabric_replan test_fabric_replan.cpp)
+    target_link_libraries(test_fabric_replan PRIVATE vortyx_fabric)
+    add_test(NAME FabricReplanTest COMMAND test_fabric_replan)
+
+    add_executable(test_fabric_e2e test_fabric_e2e.cpp)
+    target_link_libraries(test_fabric_e2e PRIVATE vortyx_fabric)
+    add_test(NAME FabricE2ETest COMMAND test_fabric_e2e)
 endif()

@@ -256,3 +256,19 @@ stubs Supabase normally provides, drops/recreates its test database, and
 exits non-zero on any failed check). It is test-only and touches no
 production database; applying to a real Supabase project remains the
 operator's procedure.
+
+## Phase 16 — no schema change (by design)
+
+The Adaptive Compute Fabric's plan metadata is RUNTIME memory
+representation (see `docs/fabric/architecture.md`): plan versions,
+lineage and explanations live in the fabric's own bounded structures, and
+the service's contract exposes a bounded, derived summary. No migration
+was added, no table was created, and nothing in 0001–0004 was touched.
+The PostgreSQL 17 integration suite (29 checks over 0001 → 0004 +
+idempotency + the concurrency races) therefore still exercises the
+complete schema — re-run unchanged in Phase 16 and passing.
+
+Applying migrations to the real Supabase production project remains the
+operator's procedure (see `docs/platform/deployment-checklist.md`);
+whether the production schema is current is a deployment-state fact to
+verify there, never something this repository can assert.

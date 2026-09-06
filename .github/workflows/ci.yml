@@ -244,6 +244,35 @@ jobs:
       - name: Test
         run: ctest --test-dir build-no-service -C Release --output-on-failure
 
+  # Phase 16: the Adaptive Compute Fabric is additive ON TOP of the
+  # distributed layer; with VORTYX_ENABLE_FABRIC=OFF the fabric disables
+  # itself — and the tensor layer (its Phase 16 adapter builds on the
+  # fabric) with it — reproducing the Phase 15 build exactly. A separate
+  # additive job keeps every existing job untouched (the matrix jobs above
+  # build with the fabric ON by default, so the fabric tests run on
+  # Windows/Ubuntu/Clang already).
+  build-no-fabric:
+    name: Build & Test Fabric=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure (CMake, fabric disabled)
+        shell: bash
+        run: cmake -B build-no-fabric -S . -DCMAKE_BUILD_TYPE=Release -DVORTYX_ENABLE_FABRIC=OFF
+
+      - name: Build
+        run: cmake --build build-no-fabric --config Release
+
+      - name: Test
+        run: ctest --test-dir build-no-fabric -C Release --output-on-failure
+
   # Phase 15.0.1 verification hardening: the database-level guarantees
   # (project-row quota serialization, artifact-capacity serialization, the
   # rate-limit RPC, terminal-state immutability, the claim race) are

@@ -71,6 +71,10 @@ ServiceStatus PlatformService::create(Deps deps, const PlatformServiceConfig& co
             return ServiceStatus::InvalidInput;
         }
     }
+    if (config.fabric_planning && config.fabric_planner.validate(error) != Status::Ok) {
+        error = "invalid fabric planner configuration: " + error;
+        return ServiceStatus::InvalidInput;
+    }
 
     // The orchestrator (the EXISTING Phase 12 facade) — the service never
     // builds a second scheduler.
@@ -79,6 +83,15 @@ ServiceStatus PlatformService::create(Deps deps, const PlatformServiceConfig& co
     orchestrator_deps.transport = deps.transport;
     orchestrator_deps.clock = deps.clock;
     orchestrator_deps.platform_store = deps.platform_store;
+
+    // Phase 16 (optional): the fabric's policy bridge takes the placement
+    // seam — the orchestrator's execution behavior is unchanged.
+    std::shared_ptr<vortyx::fabric::FabricPolicy> fabric_policy;
+    if (config.fabric_planning) {
+        fabric_policy = vortyx::fabric::make_fabric_policy(config.fabric_planner);
+        orchestrator_deps.policy_override = fabric_policy;
+    }
+
     std::unique_ptr<vortyx::distributed::DistributedOrchestrator> orchestrator;
     if (DistributedOrchestrator::create(std::move(orchestrator_deps), deps.distributed_config,
                                         orchestrator, error) != Status::Ok) {
@@ -90,6 +103,7 @@ ServiceStatus PlatformService::create(Deps deps, const PlatformServiceConfig& co
     service->deps_ = std::move(deps);
     service->config_ = config;
     service->orchestrator_ = std::move(orchestrator);
+    service->fabric_policy_ = std::move(fabric_policy);
 
     // Providers: the injected ones, or the owned in-memory references.
     service->projects_ = service->deps_.project_store;
@@ -498,11 +512,25 @@ void PlatformService::dispatcher_loop() {
         (void)orchestrator_status;  // the record's own status is the truth
         metrics_.dec_jobs_running();
 
-        // The payload's job is done: erase it under the lock.
+        // The payload's job is done: erase it under the lock. Phase 16:
+        // the fabric plan metadata (if the fabric-planned path produced
+        // one) is read from the policy NOW — after submit returned (the
+        // dispatch handoff gives this thread happens-before over the
+        // policy's placement state) — and copied into the view.
         {
             std::lock_guard<std::mutex> lock(state_);
             const auto it = records_.find(queued.job_id);
-            if (it != records_.end()) it->second.request.reset();
+            if (it != records_.end()) {
+                it->second.request.reset();
+                if (fabric_policy_ != nullptr) {
+                    const vortyx::fabric::ComputePlan* plan =
+                        fabric_policy_->last_plan_for(queued.job_id);
+                    if (plan != nullptr) {
+                        it->second.view.plan_available = true;
+                        it->second.view.plan = vortyx::fabric::summarize_plan(*plan);
+                    }
+                }
+            }
         }
         finalize_terminal(queued.job_id, dist_record.status, dist_record.error, &dist_record);
     }
@@ -559,6 +587,12 @@ void PlatformService::finalize_terminal(const JobId& job_id, DistributedJobStatu
                    status == DistributedJobStatus::Completed ? AuditOutcome::Ok
                                                              : AuditOutcome::Error,
                    status == DistributedJobStatus::Completed ? "" : to_string(status));
+
+    // Phase 16: the job's plan lineage is consumed — the plan metadata was
+    // copied into the view at dispatch end; the policy's per-job state is
+    // released here (bounded state, the request-map discipline).
+    if (fabric_policy_ != nullptr) fabric_policy_->forget(job_id);
+
     terminal_cv_.notify_all();
 }
 

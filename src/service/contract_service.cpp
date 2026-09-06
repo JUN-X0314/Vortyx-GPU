@@ -54,6 +54,27 @@ std::string serialize_service_job(const ServiceJobView& job) {
         root.add("succeeded_shards", JsonValue::make_null());
         root.add("failed_shards", JsonValue::make_null());
     }
+    // Phase 16 (optional, additive): the fabric plan summary — a nullable
+    // object. Absent (null) when the job was never fabric-planned; the
+    // web console renders that honestly as "not available".
+    if (job.plan_available) {
+        JsonValue plan = JsonValue::make_object();
+        plan.add("plan_version",
+                 JsonValue::make_number(static_cast<double>(job.plan.plan_version)));
+        plan.add("planner", JsonValue::make_string(job.plan.planner_name));
+        plan.add("planner_version", JsonValue::make_string(job.plan.planner_version));
+        plan.add("cluster_revision",
+                 JsonValue::make_number(static_cast<double>(job.plan.cluster_revision)));
+        JsonValue devices = JsonValue::make_array();
+        for (const std::string& device : job.plan.devices) {
+            devices.push(JsonValue::make_string(device));
+        }
+        plan.add("devices", std::move(devices));
+        plan.add("reason", JsonValue::make_string(job.plan.reason_summary));
+        root.add("plan", std::move(plan));
+    } else {
+        root.add("plan", JsonValue::make_null());
+    }
     return root.serialize();
 }
 

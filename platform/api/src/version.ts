@@ -3,4 +3,4 @@
 // source); both sides are bumped together and the version tests + docs
 // pin the agreement.
 
-export const SOFTWARE_VERSION = "0.15.1";
+export const SOFTWARE_VERSION = "0.16.0";

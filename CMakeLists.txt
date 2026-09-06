@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.15.1
+    VERSION 0.16.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )
@@ -23,10 +23,12 @@ option(VORTYX_ENABLE_PLATFORM "Build the Vortyx platform (control-plane) layer" 
 # which disables it automatically — reproduces the Phase 11 build exactly.
 option(VORTYX_ENABLE_DISTRIBUTED "Build the Vortyx distributed (multi-device) layer" ON)
 # Phase 13: the tensor (AI/ML acceleration) layer. Builds ON TOP of the
-# distributed layer (it reads cluster snapshots and reuses the platform
-# identity vocabulary) and the Phase 4 resource system (the ONLY allocation
-# path — no second memory world). OFF — or PLATFORM/DISTRIBUTED=OFF, which
-# disable it automatically — reproduces the Phase 12 build exactly.
+# fabric layer (its Phase 16 adapter converts TensorGraph nodes into fabric
+# workload nodes) — and through it the distributed layer (it reads cluster
+# snapshots and reuses the platform identity vocabulary) and the Phase 4
+# resource system (the ONLY allocation path — no second memory world). OFF —
+# or FABRIC/DISTRIBUTED/PLATFORM=OFF, which disable it automatically —
+# reproduces the Phase 12 build (plus the fabric layer when it is ON).
 option(VORTYX_ENABLE_TENSOR "Build the Vortyx tensor (AI/ML acceleration) layer" ON)
 
 # Phase 14: the service layer (Production GPU Platform / Serviceization).
@@ -43,6 +45,15 @@ option(VORTYX_ENABLE_SERVICE "Build the Vortyx service (platform serviceization)
 # Phase 14 build exactly (the agent is an ADJACENT process boundary, not a
 # core dependency of any layer below it).
 option(VORTYX_ENABLE_WORKER "Build the Vortyx native worker (execution agent) layer" ON)
+
+# Phase 16: the Adaptive Compute Fabric — the adaptive planning layer ON
+# TOP of the unchanged distributed layer (workload descriptors, dependency
+# graphs, the deterministic planner, plan lineage and the policy bridge
+# into the existing orchestrator). OFF — or DISTRIBUTED/PLATFORM=OFF,
+# which disable it automatically — reproduces the Phase 15 build exactly.
+# The tensor layer builds ON the fabric (its Phase 16 adapter), so
+# FABRIC=OFF disables the tensor layer with it.
+option(VORTYX_ENABLE_FABRIC "Build the Vortyx adaptive compute fabric (planning) layer" ON)
 
 # Verification-only option (Phase 15.0.1): build every target with
 # AddressSanitizer + UndefinedBehaviorSanitizer so CTest failures surface
@@ -202,20 +213,52 @@ if(VORTYX_ENABLE_DISTRIBUTED)
     endif()
 endif()
 
-# Tensor (AI/ML acceleration) layer (Phase 13).
+# Fabric (Adaptive Compute Fabric) layer (Phase 16).
 # A SEPARATE static library layered ON TOP of vortyx_distributed: the build
-# graph enforces the direction (tensor -> distributed -> platform -> core;
-# nothing below includes anything above). The tensor storage allocates
-# EXCLUSIVELY through the Phase 4 resource system, and the placement
-# integration reads Phase 12 snapshots read-only. No network code, no cloud
-# SDK, no fabricated hardware capability — the reference kernels are honest
-# CPU implementations and the runtime adapter routes into the REAL existing
-# engine. When the distributed layer is OFF — including the automatic
-# PLATFORM=OFF case — this layer is OFF with it and the build is exactly
-# Phase 12's.
+# graph enforces the direction (fabric -> distributed -> platform -> core).
+# It is the adaptive PLANNING layer: workload descriptors, dependency
+# graphs, the deterministic planner + cost model, plan lineage and the
+# policy bridge that carries plans into the UNCHANGED orchestrator seam.
+# It reads cluster snapshots, mutates nothing, and owns no execution. When
+# the distributed layer is OFF — including the automatic PLATFORM=OFF case
+# — this layer is OFF with it and the build is exactly Phase 15's.
+if(VORTYX_ENABLE_FABRIC)
+    if(NOT VORTYX_ENABLE_DISTRIBUTED)
+        message(STATUS "Vortyx: the distributed layer is OFF - the fabric layer is disabled with it")
+        set(VORTYX_ENABLE_FABRIC OFF)
+    else()
+        add_library(vortyx_fabric STATIC
+            src/fabric/workload.cpp          # WorkloadDescriptor + derivation
+            src/fabric/graph.cpp             # WorkloadGraph + topo validation
+            src/fabric/cost.cpp              # deterministic heuristic scoring
+            src/fabric/plan.cpp              # ComputePlan + stale rule + JSON
+            src/fabric/planner.cpp           # the planning core (pure)
+            src/fabric/replan.cpp            # feedback, lineage, safe replanning
+            src/fabric/policy_bridge.cpp     # FabricPolicy -> orchestrator seam
+            src/fabric/contract_fabric.cpp   # plan summary JSON (API-facing)
+        )
+        target_link_libraries(vortyx_fabric PUBLIC vortyx_distributed)
+    endif()
+endif()
+
+# Tensor (AI/ML acceleration) layer (Phase 13).
+# A SEPARATE static library layered ON TOP of vortyx_fabric (its Phase 16
+# adapter converts TensorGraph nodes into fabric workload nodes) — and
+# through it the distributed/platform/core chain the build graph enforces
+# (tensor -> fabric -> distributed -> platform -> core; nothing below
+# includes anything above). The tensor storage allocates EXCLUSIVELY
+# through the Phase 4 resource system, and the placement integration reads
+# Phase 12 snapshots read-only. No network code, no cloud SDK, no
+# fabricated hardware capability — the reference kernels are honest CPU
+# implementations and the runtime adapter routes into the REAL existing
+# engine. When the distributed or fabric layer is OFF — including the
+# automatic PLATFORM=OFF case — this layer is OFF with it.
 if(VORTYX_ENABLE_TENSOR)
     if(NOT VORTYX_ENABLE_DISTRIBUTED)
         message(STATUS "Vortyx: the distributed layer is OFF - the tensor layer is disabled with it")
+        set(VORTYX_ENABLE_TENSOR OFF)
+    elseif(NOT VORTYX_ENABLE_FABRIC)
+        message(STATUS "Vortyx: the fabric layer is OFF - the tensor layer is disabled with it (its Phase 16 adapter builds on the fabric)")
         set(VORTYX_ENABLE_TENSOR OFF)
     else()
         add_library(vortyx_tensor STATIC
@@ -233,9 +276,10 @@ if(VORTYX_ENABLE_TENSOR)
             src/tensor/plan.cpp                   # deterministic planner + memory planner
             src/tensor/graph_executor.cpp         # planned graph execution
             src/tensor/placement_integration.cpp  # Phase 12 capability-based placement
+            src/tensor/fabric_adapter.cpp         # Phase 16 TensorGraph -> fabric workload adapter
             src/tensor/serialize.cpp              # metadata-only JSON (Phase 11 strict JSON)
         )
-        target_link_libraries(vortyx_tensor PUBLIC vortyx_distributed)
+        target_link_libraries(vortyx_tensor PUBLIC vortyx_fabric)
     endif()
 endif()
 

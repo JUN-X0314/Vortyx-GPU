@@ -213,3 +213,48 @@ test("error mapping: every refusal kind has its user-facing wording", () => {
   const expired = describeApiError(new SessionExpiredError());
   assert.equal(expired.kind, "unauthorized");
 });
+
+// ---------------------------------------------------------------------------
+// Phase 16: the job detail's execution-plan rows (pure logic — the console
+// shows ONLY what the API sent, and renders an explicit not-available state
+// otherwise)
+// ---------------------------------------------------------------------------
+
+const { planSummaryRows } = await import("../js/views/job-view.js");
+
+test("plan rows: a present plan renders its recorded fields verbatim", () => {
+  const rows = planSummaryRows({
+    plan_version: 2,
+    planner: "adaptive_fabric",
+    planner_version: "0.16.0",
+    cluster_revision: 9,
+    devices: ["dev-a", "dev-b"],
+    reason: "accepted: planned 1 workload; w1 -> dev-a",
+  });
+  assert.ok(Array.isArray(rows));
+  assert.deepEqual(
+    rows.map(([label]) => label),
+    ["Plan version", "Planner", "Planner version", "Devices", "Reason"],
+  );
+  const byLabel = Object.fromEntries(rows);
+  assert.equal(byLabel["Plan version"], "2");
+  assert.equal(byLabel.Planner, "adaptive_fabric");
+  assert.equal(byLabel.Planner, "adaptive_fabric");
+  assert.equal(byLabel.Devices, "dev-a, dev-b");
+  assert.ok(byLabel.Reason.includes("planned 1 workload"));
+});
+
+test("plan rows: a null/absent plan yields no rows (the caller shows not available)", () => {
+  assert.equal(planSummaryRows(null), null);
+  assert.equal(planSummaryRows(undefined), null);
+  assert.equal(planSummaryRows("garbage"), null);
+});
+
+test("plan rows: missing fields fall back to placeholders, never invented values", () => {
+  const rows = planSummaryRows({ plan_version: 1 });
+  const byLabel = Object.fromEntries(rows);
+  assert.equal(byLabel["Plan version"], "1");
+  assert.equal(byLabel.Planner, "—");
+  assert.equal(byLabel.Devices, "none recorded");
+  assert.equal(byLabel.Reason, "—");
+});

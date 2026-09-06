@@ -1,5 +1,6 @@
 // Job detail — the REAL lifecycle: status, attempt, shard summary, error,
-// result metadata, cancel (when the role permits; the server decides).
+// result metadata, execution plan (when the API provides one), cancel
+// (when the role permits; the server decides).
 
 import { el, clear, formatTime, statusBadge, renderLoading, renderError } from "../ui.js";
 
@@ -68,6 +69,26 @@ export async function renderJobDetail(main, api, jobId) {
   execution.append(defs(rows));
   main.append(execution);
 
+  // Phase 16: the execution plan — ONLY what the API actually provides.
+  // A null plan renders an explicit "not available" state; a present plan
+  // renders its own recorded fields verbatim. The UI never invents a
+  // value the API did not send, and every string lands via textContent
+  // (no HTML injection from any API field).
+  const plan = el("section", { class: "panel" });
+  plan.append(el("h2", { text: "Execution plan" }));
+  const planRows = planSummaryRows(job.plan);
+  if (planRows !== null) {
+    plan.append(defs(planRows));
+  } else {
+    plan.append(
+      el("p", {
+        class: "muted",
+        text: "Not available: this job was not planned by the Adaptive Compute Fabric (planning is opt-in on the control plane).",
+      }),
+    );
+  }
+  main.append(plan);
+
   // The honest waiting-state note (never a fake terminal).
   if (job.status === "queued") {
     main.append(el("p", { class: "muted", text: "This job is queued in the control plane. A native worker claims it when one is connected — until then it stays queued." }));
@@ -82,4 +103,22 @@ function defs(pairs) {
     list.append(el("dt", { text: label }), el("dd", { text: String(value) }));
   }
   return list;
+}
+
+// The plan section's [label, value] rows — a PURE function so the logic
+// (what the console shows for a plan, and what it refuses to invent) is
+// testable without a DOM. Returns null when there is no plan object — the
+// caller renders the explicit "not available" state. Every value is a
+// field the API actually sent, or an em-dash placeholder: nothing here
+// fabricates a version, a device or a reason.
+export function planSummaryRows(plan) {
+  if (!plan || typeof plan !== "object") return null;
+  const devices = Array.isArray(plan.devices) ? plan.devices : [];
+  return [
+    ["Plan version", plan.plan_version === null || plan.plan_version === undefined ? "—" : String(plan.plan_version)],
+    ["Planner", plan.planner || "—"],
+    ["Planner version", plan.planner_version || "—"],
+    ["Devices", devices.length > 0 ? devices.join(", ") : "none recorded"],
+    ["Reason", plan.reason || "—"],
+  ];
 }
