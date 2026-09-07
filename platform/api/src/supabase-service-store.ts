@@ -983,7 +983,17 @@ export function createSupabaseServiceStore(
         p_shards_succeeded: report.shards_succeeded ?? null,
         p_shards_failed: report.shards_failed ?? null,
       });
-      if (error !== null && error !== undefined) return { ok: false, error: error.message };
+      if (error !== null && error !== undefined) {
+        // The RPC's documented refusal shape. Normalized to the SAME wording
+        // the memory store uses so the router's conflict (409) mapping
+        // applies identically to both stores — the DB message spells it
+        // with underscores, the router matches the store vocabulary.
+        const message = error.message ?? "";
+        if (message.startsWith("worker_complete:not_claimed_by_this_worker")) {
+          return { ok: false, error: "the job is not claimed by this worker" };
+        }
+        return { ok: false, error: message };
+      }
       const payload = data as { recorded: boolean; status: ServiceJobStatus } | null;
       if (payload === null || payload === undefined) return { ok: false, error: "the job is not claimed by this worker" };
       return { ok: true, recorded: payload.recorded, status: payload.status };
