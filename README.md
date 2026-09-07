@@ -67,9 +67,9 @@ Phase 17 changes NO architecture and NO fabric algorithm: it closes the gap betw
 | Layer | Status | Evidence (2026-09-07) |
 |---|---|---|
 | Implemented | PASS | this tree; every fix tied to a reproduced failure above |
-| Locally verified | PASS | tsc clean; API 69/69; web 20/20; bundle integrity + runtime smoke PASS; secret scan PASS |
-| CI verified | PASS | GitHub Actions run #30 on `d28d390` (build matrix Windows+Ubuntu, CPU-only, Platform=OFF, Clang, Tensor=OFF, Service=OFF, Fabric=OFF, PostgreSQL 17 migrations + concurrency races, ASan+UBSan, platform-api, web, PLUS the new typecheck / bundle-integrity / secret-scan gates) |
-| Production deployed | PASS | `dpl_4TgDPt4eBnXP3xHMuHu1k5kdD4b8` = main `d28d390`, READY, SSO protection disabled so the console is actually reachable |
+| Locally verified | PASS | tsc clean; API 69/69; web 20/20; C++ 47/47 (CPU-only Release ctest); bundle integrity + runtime smoke PASS; secret scan PASS |
+| CI verified | PASS | GitHub Actions run #32 on `4e5b2a7` — all 14 jobs green (build matrix Windows+Ubuntu, CPU-only, Platform=OFF, Clang, Tensor=OFF, Service=OFF, Fabric=OFF, PostgreSQL 17 migrations + concurrency races, ASan+UBSan, platform-api, web, PLUS the new typecheck / bundle-integrity / secret-scan gates; run #31 honestly FAILED first on the version test — the C++ version pin must be bumped with the code, that is the test working) |
+| Production deployed | PASS | `dpl_3p1xiE4QuSXtjkDinzxhGYkd8p1J` = main `4e5b2a7`, READY, SSO protection disabled so the console is actually reachable |
 | Production smoke verified | PASS | `npm run smoke:production` 11/11 against `https://vortyx-gpu-platform.vercel.app` |
 | Database verified | PASS | migrations 0001–0010 applied verbatim + recorded in `supabase_migrations.schema_migrations`; `npm run verify:schema` all-PASS |
 | E2E verified | PASS | `npm run e2e:production` 46/46 incl. verified cleanup |
