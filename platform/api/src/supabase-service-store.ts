@@ -30,8 +30,6 @@ import {
   jobMemoryBytes,
   type ArtifactMetadata,
   type AuditEvent,
-  type MetricsSummary,
-  type Paged,
   type ProjectMember,
   type ProjectQuota,
   type ProjectRecord,
@@ -44,6 +42,8 @@ import {
 } from "./service-types.ts";
 import type {
   IServiceStore,
+  MetricsSummary,
+  Paged,
   ProjectWithRole,
   ServiceResult,
   SubmitJobInput,
@@ -350,10 +350,17 @@ export function createSupabaseServiceStore(
         .eq("user_id", auth.user_id)
         .order("created_at", { ascending: true });
       if (error !== null) return mapDbError(error.message, error.code);
-      const records = (data as Array<{ role: string; projects: ProjectRow }>).map((row) => ({
-        ...mapProject(row.projects),
-        role: row.role as ProjectRole,
-      }));
+      // The untyped client infers the embedded resource as any[]; the actual
+      // PostgREST payload is one embedded project row per member row (the FK
+      // guarantees it is never null). Asserted once, then filtered
+      // defensively — no `any` enters the mapping below.
+      const rows = (data ?? []) as unknown as Array<{ role: string; projects: ProjectRow }>;
+      const records = rows
+        .filter((row) => row.projects !== null && row.projects !== undefined)
+        .map((row) => ({
+          ...mapProject(row.projects),
+          role: row.role as ProjectRole,
+        }));
       return { status: "ok", record: records };
     },
 

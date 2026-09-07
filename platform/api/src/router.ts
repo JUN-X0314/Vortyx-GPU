@@ -70,7 +70,7 @@ import {
 import { serviceHttpStatus } from "./service-types.ts";
 import { InMemoryServiceStore, type IServiceStore } from "./service-store.ts";
 import type { ServiceStatus } from "./service-types.ts";
-import { PROTOCOL_VERSION } from "./types.ts";
+import { PROTOCOL_VERSION, type PlatformStatus } from "./types.ts";
 
 export interface PlatformRequest {
   method: string; // "GET" | "POST" | "PATCH" | ...
@@ -125,6 +125,8 @@ export interface PlatformDeps {
 interface Failure {
   status: number;
   body: unknown;
+  /** Extra headers (CORS when configured) — carried through unchanged. */
+  headers?: Record<string, string>;
 }
 
 function failure(platformStatus: PlatformStatus, code: string, message: string): Failure {
@@ -185,11 +187,9 @@ function parseBody(body: unknown): ParseBodyOutcome {
   return { ok: true, value: body };
 }
 
-interface ParseBodyOutcome {
-  ok: boolean;
-  status: number;
-  value?: unknown;
-}
+type ParseBodyOutcome =
+  | { ok: true; value: unknown }
+  | { ok: false; status: number };
 
 /**
  * The complete control-plane surface. Pure routing/dispatch: no business
@@ -217,7 +217,7 @@ export async function handlePlatformRequest(
   }
 }
 
-async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<Failure | { status: number; body: unknown }> {
+async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<Failure> {
   const method = request.method.toUpperCase();
   const path = normalizePath(request.path);
 
@@ -235,6 +235,7 @@ async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<F
       body: {
         status: "ok",
         protocol_version: PROTOCOL_VERSION,
+        software_version: deps.softwareVersion,
         store: deps.storeKind,
         config_error: deps.configError ?? null,
       },
@@ -405,6 +406,11 @@ async function dispatch(request: PlatformRequest, deps: PlatformDeps): Promise<F
       return storeRespond(result, (record) => serializeDistributedJob(record));
     }
   }
+  // Unreachable in practice: resolveTarget already returned not_found /
+  // method_not_allowed above, SERVICE_TARGETS were dispatched earlier, and
+  // every remaining kind returns inside the switch. Kept as the honest
+  // fallback so the function's control flow is total.
+  return notFoundRoute();
 }
 
 // ---------------------------------------------------------------------------
@@ -714,11 +720,11 @@ function matchJobId(path: string): string | null {
 
 function storeRespond<T>(
   result: { status: PlatformStatus; record?: T; error?: string; created?: boolean },
-  serialize: (record: T) => unknown,
+  serialize: (record: T) => object,
   extra?: { created?: boolean },
 ): { status: number; body: unknown } {
   if (result.status === "ok") {
-    const body: Record<string, unknown> =
+    const body: object =
       extra?.created === true
         ? { ...serialize(result.record as T), created: result.created ?? true }
         : serialize(result.record as T);
@@ -764,7 +770,7 @@ async function dispatchService(
   deps: PlatformDeps,
   auth: AuthContext,
   service: IServiceStore,
-): Promise<Failure | { status: number; body: unknown }> {
+): Promise<Failure> {
   const method = request.method.toUpperCase();
   const query = request.query ?? {};
 
@@ -945,7 +951,7 @@ async function dispatchWorker(
   path: string,
   request: PlatformRequest,
   service: IServiceStore,
-): Promise<Failure | { status: number; body: unknown }> {
+): Promise<Failure> {
   if (path === "/api/internal/reconcile") {
     if (method !== "POST" && method !== "GET") return methodNotAllowed();
     const recovered = await service.reconcile();

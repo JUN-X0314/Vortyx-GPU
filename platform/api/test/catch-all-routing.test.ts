@@ -11,7 +11,7 @@
 //   * the default store is the honest local default (memory) with a null
 //     config_error, so a missing server-side env cannot silently fake a
 //     Supabase deployment (production must report store "supabase");
-//   * the deployed software version is 0.16.1 (the version agreement is
+//   * the deployed software version is 0.17.0 (the version agreement is
 //     checked at the outermost wiring layer, not only inside the package);
 //   * unknown routes stay honest 404s and wrong methods stay 405s through
 //     the glue (a catch-all that swallows routing errors would mask both).
@@ -82,7 +82,7 @@ test("GET /api/platform/info through the glue reports the deployed version", asy
   const response = await call("GET", "https://vortyx.test/api/platform/info");
   assert.equal(response.status, 200);
   const body = response.body as Record<string, unknown>;
-  assert.equal(body.software_version, "0.16.1");
+  assert.equal(body.software_version, "0.17.0");
   assert.equal(body.protocol_version, "1");
 });
 

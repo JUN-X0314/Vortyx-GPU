@@ -79,6 +79,11 @@ vcpkg_installed/
 # Node (platform/api and the deployment root)
 node_modules/
 
+# Phase 17: the deployment container's generated function bundle (the
+# buildCommand output) and local Vercel build artifacts are never committed.
+/api/[...route].js
+.vercel/
+
 # test output & cache
 Testing/
 .cache/

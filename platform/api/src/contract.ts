@@ -12,7 +12,7 @@
 // extension (environment misconfiguration) — the C++ device side never
 // produces it.
 
-import type { PlatformStatus } from "./types.ts";
+import type { JobEnvelope, PlatformStatus } from "./types.ts";
 import { KNOWN_BACKENDS, KNOWN_OPERATIONS, MAX_JOB_ELEMENT_COUNT, PROTOCOL_VERSION } from "./types.ts";
 import { isValidId } from "./ids.ts";
 

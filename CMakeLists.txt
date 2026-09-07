@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 
 project(VortyxGPU
-    VERSION 0.16.1
+    VERSION 0.17.0
     DESCRIPTION "Vortyx GPU - Open-source GPU computing platform"
     LANGUAGES CXX
 )

@@ -255,18 +255,17 @@ test("results: cancellation is not an outcome", async () => {
   const store = new InMemoryPlatformStore();
   await store.createJob(alice, validEnvelope("job-3"), null);
   await store.updateJob(alice, "job-3", "running", "");
-  assert.equal(
-    (
-      await store.putResult(alice, {
-        job_id: "job-3",
-        status: "cancelled",
-        backend: "",
-        error: "",
-        result_element_count: null,
-      })
-    ).status,
-    "invalid_input",
-  );
+  // The static result type already forbids "cancelled"; the WIRE can still
+  // lie, and this assertion pins that the store refuses it at runtime —
+  // the cast exists to reach the runtime boundary the test exists to check.
+  const wireLie = {
+    job_id: "job-3",
+    status: "cancelled",
+    backend: "",
+    error: "",
+    result_element_count: null,
+  } as unknown as Parameters<InMemoryPlatformStore["putResult"]>[1];
+  assert.equal((await store.putResult(alice, wireLie)).status, "invalid_input");
 });
 
 test("results: a result for a never-started job is refused", async () => {

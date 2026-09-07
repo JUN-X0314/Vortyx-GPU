@@ -9,7 +9,7 @@
 //
 // Determinism: lists return records in insertion order.
 
-import { isOwner, validateAuth } from "./auth.ts";
+import { isOwner, validateAuth, type AuthContext } from "./auth.ts";
 import { isTerminal, transitionValid } from "./job-lifecycle.ts";
 import { isValidId } from "./ids.ts";
 import type { IPlatformStore, StoreFailure, StoreResult } from "./store.ts";

@@ -1,13 +1,26 @@
 {
   "name": "@vortyx/deployment-root",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "private": true,
   "type": "module",
-  "description": "Deployment glue for the single-project Vercel topology. The root api/[...route].ts catch-all re-uses the real platform API router (platform/api/src/vercel.ts); when VORTYX_STORE=supabase its dynamic import chain reaches @supabase/supabase-js, so the dependency is declared here for the function's module resolution. It is never installed or used by the C++ build, the platform/api tests (which run inside platform/api with their own manifest), or the web console.",
+  "description": "Deployment glue for the single-project Vercel topology. The root api/[...route].ts catch-all re-uses the real platform API router (platform/api/src/vercel.ts). Phase 17: the Vercel buildCommand (scripts/build-api-bundle.mjs) bundles the catch-all WITH its whole runtime dependency chain (including @supabase/supabase-js, declared here) into one self-contained function file, so the lambda never resolves a cross-directory module at runtime. The scripts are never installed or used by the C++ build, the platform/api tests (which run inside platform/api with their own manifest), or the web console.",
   "engines": {
     "node": ">=22.6"
   },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "verify:bundle": "node scripts/verify_vercel_bundle.mjs",
+    "scan:secrets": "node scripts/scan_secrets.mjs",
+    "smoke:production": "node scripts/production_smoke_test.mjs",
+    "verify:schema": "node scripts/verify_supabase_schema.mjs",
+    "e2e:production": "node scripts/production_e2e_test.mjs"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
   }
 }

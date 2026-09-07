@@ -27,7 +27,7 @@
 // NO REAL VALUES ARE COMMITTED ANYWHERE IN PHASE 11. .env.example is the
 // template; .env* files are git-ignored.
 
-import { makeAuthenticated, type AuthContext } from "./auth.ts";
+import { makeAuthenticated, type AuthContext, type TokenVerifier } from "./auth.ts";
 import { SOFTWARE_VERSION } from "./version.ts";
 import type { IPlatformStore } from "./store.ts";
 import { InMemoryPlatformStore } from "./memory-store.ts";
@@ -64,6 +64,13 @@ export function readConfig(env: Record<string, string | undefined>): PlatformCon
       configError =
         "VORTYX_STORE=supabase requires SUPABASE_URL and SUPABASE_ANON_KEY (see .env.example)";
     }
+  } else if (env["VERCEL_ENV"] === "production") {
+    // Phase 17: a production deployment NEVER falls back to the in-memory
+    // store. Vercel injects VERCEL_ENV=production into every function, so a
+    // missing server-side env contract there is a genuine misconfiguration
+    // — reported loudly (config_error), never silently faked by memory mode.
+    configError =
+      "production requires VORTYX_STORE=supabase with SUPABASE_URL and SUPABASE_ANON_KEY (the memory store is local/test only)";
   }
   return {
     store,
@@ -88,7 +95,10 @@ export function readConfig(env: Record<string, string | undefined>): PlatformCon
  * deployment (there is no real credential behind it). The supabase verifier
  * validates a genuine Supabase Auth access token server-side.
  */
-export type TokenVerifier = (token: string) => Promise<AuthContext | null>;
+// The verifier seam itself lives in auth.ts (the auth boundary module) so
+// the router and this resolver share ONE definition; re-exported here for
+// the resolution API's consumers.
+export type { TokenVerifier };
 
 function memoryVerifier(): TokenVerifier {
   return async (token: string) => {
@@ -132,9 +142,15 @@ export interface ResolvedPlatform {
  * the router turns that into a 500 config_error response (no fake success).
  */
 export async function resolvePlatform(config: PlatformConfig): Promise<ResolvedPlatform> {
+  // A configuration error is NEVER a silent fallback: whatever the store
+  // kind, a misconfigured deployment throws (the router maps it to the
+  // honest 500 config_error — production cannot drift into memory mode).
+  if (config.configError !== null) {
+    throw new Error(config.configError);
+  }
   if (config.store === "supabase") {
-    if (config.configError !== null || config.supabaseUrl === null || config.supabaseAnonKey === null) {
-      throw new Error(config.configError ?? "supabase store is not configured");
+    if (config.supabaseUrl === null || config.supabaseAnonKey === null) {
+      throw new Error("supabase store is not configured");
     }
     // Dynamic import: nothing in the test or local-dev path ever loads the
     // supabase adapters (or @supabase/supabase-js).

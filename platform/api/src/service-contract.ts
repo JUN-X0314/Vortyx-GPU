@@ -8,6 +8,7 @@
 // service contract's vocabulary field for field.
 
 import { isValidId } from "./ids.ts";
+import type { MetricsSummary } from "./service-store.ts";
 import {
   MAX_ARTIFACTS_PER_PROJECT,
   MAX_JOB_ELEMENT_COUNT,
@@ -15,7 +16,6 @@ import {
   MAX_REQUESTED_SHARD_COUNT,
   type ArtifactMetadata,
   type AuditEvent,
-  type MetricsSummary,
   type ProjectMember,
   type ProjectQuota,
   type ProjectRecord,

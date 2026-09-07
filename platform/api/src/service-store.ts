@@ -306,13 +306,20 @@ export class InMemoryServiceStore implements IServiceStore {
     return { status: "ok", record: { ...project } };
   }
 
-  async projects(auth: AuthContext): Promise<ServiceResult<ProjectRecord[]>> {
+  async projects(auth: AuthContext): Promise<ServiceResult<ProjectWithRole[]>> {
     const authFailure = this.requireAuth(auth);
     if (authFailure !== null) return authFailure;
-    const visible = this.projectRows.filter(
-      (p) => this.roleOfLocked(p.project_id, auth.user_id) !== null,
-    );
-    return { status: "ok", record: visible.map((p) => ({ ...p })) };
+    // The caller's role rides on every listed project (the IServiceStore
+    // contract and the supabase adapter's shape — the router serializes
+    // `role` from each record). Insertion order = creation order, the same
+    // ordering the Supabase adapter's created_at-ascending query produces.
+    const records: ProjectWithRole[] = [];
+    for (const project of this.projectRows) {
+      const role = this.roleOfLocked(project.project_id, auth.user_id);
+      if (role === null) continue;
+      records.push({ ...project, role });
+    }
+    return { status: "ok", record: records };
   }
 
   async archiveProject(auth: AuthContext, projectId: string): Promise<ServiceResult<ProjectRecord>> {

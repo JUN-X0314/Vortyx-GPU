@@ -251,7 +251,7 @@ describe("distributed routes", () => {
   function deps(): PlatformDeps {
     return {
       store: new InMemoryPlatformStore(),
-      verifier: (token) =>
+      verifier: async (token) =>
         token.startsWith("local:")
           ? makeAuthenticated(token.slice("local:".length))
           : null,

@@ -351,3 +351,62 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-sanitize -C Debug --output-on-failure
+
+  # Phase 17: the deployment gate. TypeScript type errors were invisible to
+  # every local/CI test (node --test strips types WITHOUT checking them) —
+  # the production build surfaced dozens of them, then deployed anyway
+  # (Vercel READY is not a typecheck). A tsc failure here is a deployment
+  # blocker by construction: main cannot go green with a broken bundle.
+  typecheck:
+    name: TypeScript typecheck (tsc --noEmit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck (deployment-blocking)
+        run: npx tsc -p tsconfig.json
+
+  # Phase 17: bundle integrity + runtime smoke. Builds the EXACT artifact
+  # the Vercel buildCommand builds, imports it under the real Node runtime
+  # and invokes /api/health, /api/platform/info, an unknown route, a wrong
+  # method and a CORS preflight — the ERR_MODULE_NOT_FOUND failure mode is
+  # caught here, before any deployment, never on the live URL again.
+  bundle-integrity:
+    name: API bundle integrity + runtime smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node (24 = the deployment runtime)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Bundle integrity + runtime smoke
+        run: node scripts/verify_vercel_bundle.mjs
+
+  # Phase 17: the secret boundary, automated. Server-only secrets never
+  # enter the repository; the publishable browser config is the only
+  # committed credential-shaped value and it is not JWT/secret shaped.
+  secret-scan:
+    name: Secret boundary scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan tracked files for credential-shaped content
+        run: node scripts/scan_secrets.mjs

@@ -23,6 +23,14 @@ export interface AuthContext {
   access_token?: string;
 }
 
+/**
+ * The router's token-verifier seam: resolves a presented Bearer token into
+ * an AuthContext, or null when the token is unusable. Defined HERE (the
+ * auth boundary module) so the router and the config resolver share ONE
+ * definition; config.ts re-exports it for its own resolution API.
+ */
+export type TokenVerifier = (token: string) => Promise<AuthContext | null>;
+
 export function makeAuthenticated(userId: string): AuthContext {
   return { authenticated: true, user_id: userId };
 }
