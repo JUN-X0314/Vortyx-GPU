@@ -6,7 +6,7 @@ Vortyx GPU is an independent open-source project that researches and develops **
 
 The long-term goal is to build a software-based GPU computing system, then evolve through Virtual GPU, multi-device computing, distributed computing, and FPGA prototypes, ultimately researching and developing Vortyx's own GPU hardware architecture.
 
-## Current Phase: Phase 16.0.1 (v0.16.1) — Production Wiring, Deployment Integration & Hardening
+## Current Phase: Phase 17 (v0.17.0) — Production Reliability, Deployment Completion & Runtime Integrity
 
 Phase 16 adds the **Adaptive Compute Fabric** — `vortyx::fabric` (`src/fabric/`), a static library layered ON TOP of the unchanged Phase 12 distributed system — as Vortyx's adaptive planning layer. It is NOT a new scheduler and it executes nothing: it analyzes workloads, decides placements deterministically, explains every decision, and hands its plans to the EXISTING execution path through Phase 12's own policy seam.
 
@@ -20,7 +20,7 @@ Phase 16 adds the **Adaptive Compute Fabric** — `vortyx::fabric` (`src/fabric/
 - **TensorGraph adapter**: `tensor/fabric_adapter` converts a validated int32 contiguous elementwise Add/Multiply TensorGraph into a fabric WorkloadGraph (the SAME mapping rule the Phase 13 runtime adapter established — nothing invented); every other op/dtype REFUSES the conversion naming the node, because no device vocabulary claims it. This is graph planning and placement abstraction only — no GPU tensor acceleration is claimed, and cross-device transfer still does not exist (a plan needing one is refused, never faked).
 - **Honest scope**: the fabric is a planning and orchestration research layer. There is no machine-learning scheduler, no measured-performance scoring, no fabricated GPU telemetry, no work stealing, no priority fairness guarantees (priority orders planning; it is not a starvation-free scheduler), no transfer engine, and no distributed network path beyond Phase 12's documented loopback.
 
-## Phase 16.0.1 — Production Wiring, Deployment Integration & Hardening (v0.16.1, current)
+## Phase 16.0.1 — Production Wiring, Deployment Integration & Hardening (v0.16.1, superseded by 17.0)
 
 Phase 16.0.1 changes NO architecture and NO fabric algorithm: it wires the EXISTING code to the real production infrastructure and closes the two observed production failures at the root (the web console's "Configuration required" screen and the API's `/api/health` 404).
 
@@ -30,6 +30,52 @@ Phase 16.0.1 changes NO architecture and NO fabric algorithm: it wires the EXIST
 - **Version sync**: 0.16.1 across CMake, `version.hpp`, the version test, `version.ts`, both package manifests and this README (the C++ binary and the API report the same version).
 
 **Verification, stated precisely (code exists ≠ locally run ≠ production verified)**: the code changes are verified locally (the full C++ suite 47/47 including the fabric suites after restoring the accidentally truncated CMakeLists; TypeScript 69/69; web 20/20; feature-off configure spot checks). The committed Supabase values were verified LIVE against the real project (`/auth/v1/health` → 200 with the committed key; 401 without it). The production HTTP smoke checks (root 200, `/js/config.js` 200 with the three allowlisted fields, `/api/health` reporting `store: "supabase"` and `config_error: null`) require a deployment of this revision plus the applied schema — they are the operator's documented post-deploy steps in `docs/platform/deployment-checklist.md`, never assumed.
+
+## Phase 17 — Production Reliability, Deployment Completion & Runtime Integrity (v0.17.0, current)
+
+Phase 17 changes NO architecture and NO fabric algorithm: it closes the gap between "the code exists" and "the running deployment is verified" — and every claim below carries the command that reproduces it.
+
+**What was actually broken, found by reproducing reality instead of trusting READY banners:**
+
+- **The deployment's runtime was dead while reporting READY.** The production build log (deployment `dpl_3adCauf1GqQmQvd7hQJQ7GZDE5j7`) shows two facts: the TypeScript check FAILED with dozens of errors, and the deployment shipped anyway. At runtime every `/api/*` request died with `ERR_MODULE_NOT_FOUND: /var/task/platform/api/src/vercel.ts` — Vercel's per-file function build preserves the literal `"../platform/api/src/vercel.ts"` import and never traced the file into the lambda. **Fix:** the Vercel `buildCommand` (`scripts/build-api-bundle.mjs`) bundles the catch-all with esbuild into ONE self-contained ESM function (the whole `platform/api` chain AND `@supabase/supabase-js` inlined, ~1 MB) and overwrites the entry in place (deleting it breaks Vercel's function discovery — observed live on `dpl_ADNP55LDD23BDkuioThAeSyGS3iE`); the repository source is untouched.
+- **Multi-segment API routes never reached the function at all** — verified against the PREVIOUS deployment too, so this predates Phase 17 and made `/api/platform/info` (the checklist's own smoke check) impossible: the zero-config catch-all only ever matched `/api/<one-segment>`; everything deeper hit Vercel's filesystem 404. **Fix:** an explicit rewrite in `vercel.json` pins the contract — every `/api/*` request, any depth, goes to the single API function.
+- **TypeScript errors were invisible to every test.** `node --test --experimental-strip-types` strips types WITHOUT checking them; CI was green while the production build listed `TS2305`/`TS2322`/`TS5097`… failures. **Fix:** a root `tsconfig.json` (allowImportingTsExtensions, noEmit, strict, `@types/node`) and a CI `typecheck` job — all REAL errors fixed without a single `any`: `TokenVerifier` now lives in `auth.ts` (the router imported it from the wrong module), missing `PlatformStatus`/`JobEnvelope` imports completed, `ParseBodyOutcome` is a proper discriminated union, dispatch outcomes carry optional headers, and `InMemoryServiceStore.projects()` now implements the `IServiceStore` contract (`ProjectWithRole[]`, matching the Supabase adapter and the router's `role` serialization). The two-project adapters' broken `../src/vercel.ts` import paths are fixed too.
+- **The worker protocol was callable by ANY user at the database.** 0003's SECURITY DEFINER RPCs (`vortyx_worker_claim/_heartbeat/_complete/_reconcile`) kept PostgreSQL's default `EXECUTE TO PUBLIC` — any authenticated user could POST `/rest/v1/rpc/vortyx_worker_claim` and claim/complete/fabricate outcomes for ARBITRARY jobs, bypassing the worker-token boundary entirely. **Fix (0005):** the RPCs are locked to `service_role`, trigger-only definer functions lose their API-role EXECUTE, audit inserts are bound to the verified subject (0003 allowed forging arbitrary `actor_user_id`), and the platform-side `rls_auto_enable()` helper is revoked from anon/authenticated.
+- **Production silently ran the in-memory store.** With zero Vercel env vars configured, `VORTYX_STORE` defaulted to `memory` — an ephemeral, per-lambda fake. **Fix:** under `VERCEL_ENV=production` a missing env contract is a hard `config_error` (the API answers 500, never a quiet fallback), and the real production environment (store=supabase, URL, publishable anon key, service-role key, worker/reconcile secrets, empty same-origin CORS) is configured server-side on Vercel.
+- **Five latent database defects, each reproduced live before fixing** (the CI integration suite runs as the table owner and can never see them — RLS is not evaluated for owners):
+  1. `0006` — the 0003 member policies self-referenced `project_members` → `42P17 infinite recursion` killed EVERY member-visible path for ordinary users (even `POST /api/projects`); a SECURITY DEFINER membership probe (`vortyx_is_project_member`) breaks the chain, semantics unchanged.
+  2. `0007` — RLS policies are not privileges: tables created outside the platform's default-privilege path had NO grants for `authenticated` (every statement failed with `42501` before RLS even ran). The explicit, policy-derived grant set is now in the migration (anon: nothing; rate-limit counters: service-role/definer only).
+  3. `0008` — `projects.owner_user_id` had no default while the adapter inserts `{name}` only → the insert policy could never pass; the default is `auth.uid()` and the WITH CHECK still pins `owner = auth.uid()`.
+  4. `0009` — `INSERT ... RETURNING` evaluates BEFORE after-triggers, so the owner member row did not exist yet and the membership-only visibility policy hid the row the creator had just inserted; owners now see their projects by ownership (same steady-state row set, correct insert window).
+  5. `0010` — `projects.id` / `artifact_metadata.artifact_id` had no generation default (0003's own comment says "server-generated UUIDs"); the adapter's service-job insert missed the NOT NULL `submitted_at_ms` the memory store always stamps. Both fixed at the layer that owns them.
+- **The worker-complete refusal is now one conflict shape across stores:** the adapter normalizes the RPC's `worker_complete:not_claimed_by_this_worker` to the memory store's wording so the router maps it to 409 identically.
+
+**The production gate is a command, not a dashboard:**
+
+| Command | What it pins |
+|---|---|
+| `npm run typecheck` | tsc — the deployment-blocking TypeScript gate |
+| `npm run verify:bundle` | builds the EXACT deployment artifact, imports it, invokes health/info/404/405/preflight through the bundled function |
+| `npm run scan:secrets` | the secret boundary: no JWT/`sb_secret_`/`sbp_`/`ghp_`/`vcp_` shapes, no server-only env values, no tracked `.env` — findings print file:line + pattern, never values |
+| `npm run smoke:production` | the live URL: static console, the three-field publishable config, `/api/health` (store=supabase, config_error=null, version), `/api/platform/info`, honest 404/405, no CORS surface, no SSO redirect, Supabase auth healthy with the DEPLOYED key |
+| `npm run verify:schema` | the live database vs the repository inventory: migration ledger (0001–0010), all 14 tables + RLS, the policy backstop, worker RPCs locked to service_role, triggers, SECURITY DEFINER inventory (unknown objects = DRIFT) — PASS/FAIL/DRIFT exit codes |
+| `npm run e2e:production` | REAL end-to-end: two throwaway Supabase identities (admin-created, tagged, deleted + deletion verified), signup→login→me→project CRUD→role contract→anti-enumeration→quota→idempotent replay→conflict→concurrent quota refusal (429)→worker claim/heartbeat/complete→idempotent completion→cancel-vs-claim→stale-lease reconcile→usage release→audit→metrics→direct RLS probes→cleanup (failure fails the run) |
+| `python3 scripts/apply_migrations.py` | applies `platform/supabase/migrations/*.sql` VERBATIM in order to the real project, ledger-aware and idempotent |
+
+**Verification, stated precisely (implemented ≠ locally verified ≠ CI verified ≠ production verified):**
+
+| Layer | Status | Evidence (2026-09-07) |
+|---|---|---|
+| Implemented | PASS | this tree; every fix tied to a reproduced failure above |
+| Locally verified | PASS | tsc clean; API 69/69; web 20/20; bundle integrity + runtime smoke PASS; secret scan PASS |
+| CI verified | PASS | GitHub Actions run #30 on `d28d390` (build matrix Windows+Ubuntu, CPU-only, Platform=OFF, Clang, Tensor=OFF, Service=OFF, Fabric=OFF, PostgreSQL 17 migrations + concurrency races, ASan+UBSan, platform-api, web, PLUS the new typecheck / bundle-integrity / secret-scan gates) |
+| Production deployed | PASS | `dpl_4TgDPt4eBnXP3xHMuHu1k5kdD4b8` = main `d28d390`, READY, SSO protection disabled so the console is actually reachable |
+| Production smoke verified | PASS | `npm run smoke:production` 11/11 against `https://vortyx-gpu-platform.vercel.app` |
+| Database verified | PASS | migrations 0001–0010 applied verbatim + recorded in `supabase_migrations.schema_migrations`; `npm run verify:schema` all-PASS |
+| E2E verified | PASS | `npm run e2e:production` 46/46 incl. verified cleanup |
+| Security verified | PASS | worker RPCs service-role-only (probed live: user RPC → 403), audit actor bound, secret scan clean, no browser secret surface |
+
+**Known limitations, stated:** deployment URLs are served by one Vercel function (fluid compute, Node 24); the C++ worker agent still has no production host (jobs queue honestly — that is the documented execution-plane contract); `docs/platform/deployment-checklist.md`'s two-project topology remains documented but unverified in production; GitHub repository secrets for the production-gate workflow were not configured (the gate commands above run from an operator shell with the tokens in the environment).
 
 ## Phase 15.0.1 — Production Stabilization (v0.15.1, kept in force)
 
@@ -461,7 +507,7 @@ Example output — **actual devices and timing numbers depend on the machine; ti
 ```
 ========================================
   Vortyx GPU
-  Version: 0.16.1
+  Version: 0.17.0
   Phase:   15 (Production Platform Integration)
   Build:   Release
 ========================================
@@ -785,7 +831,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 | Test | What it verifies |
 |------|------------------|
-| VersionTest | Version constants match 0.16.1 |
+| VersionTest | Version constants match 0.17.0 |
 | LoggerTest | Logger output format |
 | DeviceDiscoveryTest | Phase 2 device discovery (unchanged, still passing) |
 | ComputeCpuTest | Runtime lifecycle, CPU vector addition (sizes 4/16/1024/10007), invalid input handling, unknown/unavailable backends, shutdown/re-init — through the resource layer |
@@ -860,7 +906,8 @@ Run it yourself when you want actual measurements; treat every number it prints 
 | 0.14 | Production GPU Platform / Serviceization (provider-neutral `vortyx::service` layer over the whole stack: projects + membership roles with ONE pure authorization table, project quota ledger with exactly-once release, deterministic fixed-window rate limiting, provider-neutral job queue, the full submission flow into the UNCHANGED Phase 12 orchestrator under the submitter's identity, bounded audit events, real-counter metrics, honest health reporting, artifact metadata registry, machine-readable JSON contract; no HTTP server in the core / no external provider adapters / no billing — documented non-goals) | Implemented |
 | 0.15 | Production Platform Integration (service contract fixes: single-owner invariant, privileged audited cross-user cancellation with atomic intent delivery replacing sleep-polling, bounded artifact registry; the native execution boundary `vortyx::worker` + `vortyx_worker_agent` speaking the worker protocol over the UNCHANGED Phase 12 stack; the full service API surface over memory/Supabase persistence with RLS + additive migration 0003 (quota trigger, single-owner trigger, atomic claim RPC, centralized rate-limit RPC); stale-lease reconciliation; the no-build web console; 40 C++ + 54 TypeScript + 8 web tests) | Implemented |
 | 0.16 | Adaptive Compute Fabric (the adaptive planning layer `vortyx::fabric` over the UNCHANGED distributed system: workload descriptors derived from the Phase 11 envelope, dependency graphs with deterministic topo ordering, a pure deterministic planner with named-component int64 scoring and structured explanations, ComputePlan artifacts with cluster-revision stamping and deterministic serialization, plan lineage with safe replanning that preserves succeeded shards and bumps versions monotonically, the FabricPolicy bridge through the orchestrator's NEW optional policy_override seam, an opt-in service integration with honest nullable plan metadata in the contract, a TensorGraph adapter for int32 elementwise graphs with honest refusals, and 47 C++ + 63 TypeScript + 11 web tests) | Implemented |
-| 0.16.1 | Production Wiring, Deployment Integration & Hardening (the two observed production failures closed at the root: the web console's runtime configuration committed with PUBLISHABLE values only and pinned by an allowlist/secret-scanning test suite, and the single-project Vercel topology — the root `api/[...route].ts` catch-all re-using the REAL router with `@supabase/supabase-js` provided by a root manifest; deployment wiring tests import the catch-all itself and pin /api/health, /api/platform/info, 404/405 honesty and the version agreement; the committed Supabase values verified LIVE against the real project; version 0.16.1 synced everywhere; NO fabric algorithm change, NO architecture change) | **Implemented (current)** |
+| 0.16.1 | Production Wiring, Deployment Integration & Hardening (the two observed production failures closed at the root: the web console's runtime configuration committed with PUBLISHABLE values only and pinned by an allowlist/secret-scanning test suite, and the single-project Vercel topology — the root `api/[...route].ts` catch-all re-using the REAL router with `@supabase/supabase-js` provided by a root manifest; deployment wiring tests import the catch-all itself and pin /api/health, /api/platform/info, 404/405 honesty and the version agreement; the committed Supabase values verified LIVE against the real project; version 0.16.1 synced everywhere; NO fabric algorithm change, NO architecture change) | **Implemented (superseded by 17.0)** |
+| 0.17.0 | Production Reliability, Deployment Completion & Runtime Integrity (NO architecture or algorithm change: the deployment's dead runtime closed at the root — the catch-all is bundled into ONE self-contained function by the Vercel buildCommand and an explicit rewrite routes every /api/* depth into it (multi-segment routes never reached the function, verified against the previous deployment); CI gains the deployment-blocking gates the stack lacked — real tsc typecheck (the production build surfaced dozens of type errors that node --test's type stripping cannot see, all fixed without a single any), bundle integrity + runtime smoke, and a secret-boundary scan; migration 0005 locks the SECURITY DEFINER worker RPCs to service_role (any authenticated user could claim/complete/fabricate arbitrary jobs through PostgREST), binds audit inserts to the verified subject and revokes the platform rls_auto_enable helper; migrations 0006-0010 fix five latent database defects each REPRODUCED live by the production E2E before fixing (member-policy self-recursion, missing table grants for non-default-privilege creation, missing owner default, INSERT...RETURNING vs after-trigger timing, missing server-generated id defaults + the adapter's missing submitted_at_ms stamp); production can no longer fall back to the memory store (VERCEL_ENV=production requires the supabase env contract, misconfiguration answers 500 config_error); verification scripts ship as commands: typecheck, bundle integrity, secret scan, production smoke, schema verification + drift detection (PASS/FAIL/DRIFT), the full production E2E with verified cleanup, and the ledger-aware migration applier; migrations 0001-0010 applied to the production project and recorded in the CLI-compatible ledger; version 0.17.0 synced everywhere; NO fabric algorithm change, NO architecture change) | **Implemented (current)** |
 | 1.0 | Local GPU Computing Platform (tensor workloads across real backends, service API deployment, external provider adapters) | Planned |
 
 ## License

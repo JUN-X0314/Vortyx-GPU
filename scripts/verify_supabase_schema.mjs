@@ -213,6 +213,7 @@ try {
       "vortyx_enforce_service_quota", "vortyx_enforce_artifact_capacity", "vortyx_audit_new_user",
       "vortyx_worker_reconcile", "vortyx_worker_claim", "vortyx_worker_heartbeat",
       "vortyx_worker_complete", "vortyx_rate_limit_take", "vortyx_enforce_terminal_immutable",
+      "vortyx_is_project_member",
     ]);
     for (const row of definers) {
       if (KNOWN_PLATFORM_DEFINERS.has(row.proname)) {
