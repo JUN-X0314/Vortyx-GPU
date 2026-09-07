@@ -2,5 +2,11 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "outputDirectory": "platform/web",
-  "buildCommand": "node scripts/build-api-bundle.mjs"
+  "buildCommand": "node scripts/build-api-bundle.mjs",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/[...route]"
+    }
+  ]
 }
