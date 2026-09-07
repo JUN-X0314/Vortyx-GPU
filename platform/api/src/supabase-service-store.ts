@@ -556,6 +556,10 @@ export function createSupabaseServiceStore(
           element_count: request.element_count,
           requested_backend: request.requested_backend,
           requested_shard_count: request.requested_shard_count,
+          // The wire contract's submission timestamp (epoch ms) — the same
+          // stamp the memory store sets at the same point. NOT NULL in the
+          // migration; the claim order depends on it.
+          submitted_at_ms: Date.now(),
         })
         .select("*")
         .single();

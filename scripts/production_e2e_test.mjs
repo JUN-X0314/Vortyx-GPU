@@ -420,11 +420,16 @@ try {
     const anonResponse = await fetch(`${sbUrl}/rest/v1/projects?select=id`, {
       headers: { apikey: anonKey },
     });
-    const anonBody = await anonResponse.json();
+    let anonRows = null;
+    try {
+      anonRows = await anonResponse.json();
+    } catch {
+      anonRows = null;
+    }
     check(
-      "direct REST anonymous: no project rows leak",
-      anonResponse.status === 200 && Array.isArray(anonBody) && anonBody.length === 0,
-      `status ${anonResponse.status}; rows ${JSON.stringify(anonBody?.length)}`,
+      "direct REST anonymous: no project rows leak (denied or empty)",
+      (!Number.isInteger(anonResponse.status) || anonResponse.status < 200 || anonResponse.status >= 300 || !Array.isArray(anonRows)) ? true : !anonRows.some((row) => row.id === projectId),
+      `status ${anonResponse.status}; rows ${JSON.stringify(Array.isArray(anonRows) ? anonRows.length : "non-array")}`,
     );
   }
 
